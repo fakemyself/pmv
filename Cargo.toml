@@ -1,5 +1,5 @@
 [package]
-name = "p8s-parser"
+name = "pmv"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 prometheus = "0.12"
+log = "0.4"
