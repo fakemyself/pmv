@@ -2,8 +2,8 @@ use prometheus::proto::{Metric, MetricFamily, MetricType};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufReader, Cursor, Read};
-//use std::rc::Rc;
+use std::io::{self, Read};
+use std::num::ParseFloatError;
 use std::str;
 
 #[derive(Debug)]
@@ -27,12 +27,14 @@ impl Error for ParseError {
 pub struct TextParser<R: Read> {
     current_byte: u8,
 
-    //current_labels: HashMap<String, String>,
+    current_labels: HashMap<String, String>,
     mf_by_name: HashMap<String, MetricFamily>,
     cur_mf_name: String,
+    cur_mf_type: MetricType,
 
     current_token: Vec<u8>,
-    //current_bucket: f64,
+    current_bucket: f64,
+    current_quantile: f64,
     current_is_summary_count: bool,
     current_is_summary_sum: bool,
     current_is_histogram_count: bool,
@@ -41,7 +43,8 @@ pub struct TextParser<R: Read> {
     reading_bytes: i32,
     reader: R,
 
-    //cur_metric: Option<Rc<Metric>>,
+    cur_metrics: Vec<Metric>,
+
     error: Option<Box<dyn Error>>,
     state_fn: StateFn<R>,
 }
@@ -56,13 +59,16 @@ enum ParserState<R: Read> {
 impl<R: Read> TextParser<R> {
     pub fn new(reader: R) -> Self {
         TextParser {
-            //current_labels: HashMap::new(),
+            current_labels: HashMap::new(),
             mf_by_name: HashMap::new(),
             cur_mf_name: String::new(),
+            cur_mf_type: MetricType::UNTYPED,
+            cur_metrics: Vec::new(),
 
             current_token: Vec::new(),
             current_byte: 0 as u8,
-            //current_bucket: 0.0,
+            current_bucket: 0.0,
+            current_quantile: 0.0,
             current_is_summary_count: false,
             current_is_summary_sum: false,
             current_is_histogram_count: false,
@@ -72,7 +78,6 @@ impl<R: Read> TextParser<R> {
             reader: reader,
             error: None,
             state_fn: TextParser::start_of_line,
-            //cur_metric: None,
         }
     }
 
@@ -143,7 +148,7 @@ impl<R: Read> TextParser<R> {
                         break;
                     }
 
-                    if let Some(_) = &self.error {
+                    if self.got_error() {
                         return ParserState::End;
                     }
 
@@ -158,12 +163,12 @@ impl<R: Read> TextParser<R> {
 
         // there is something. Next has to be a metric name.
         self.skip_blank_tab();
-        if let Some(_) = &self.error {
+        if self.got_error() {
             return ParserState::End;
         }
 
         self.read_token_as_metric_name();
-        if let Some(_) = &self.error {
+        if self.got_error() {
             return ParserState::End;
         }
 
@@ -178,9 +183,10 @@ impl<R: Read> TextParser<R> {
         self.set_or_create_current_mf();
 
         self.skip_blank_tab();
-        if let Some(_) = &self.error {
+        if self.got_error() {
             return ParserState::End;
         }
+
         if self.current_byte == '\n' as u8 {
             return self.start_of_line();
         }
@@ -193,14 +199,18 @@ impl<R: Read> TextParser<R> {
             return self.reading_type();
         }
 
-        ParserState::End // TODO
+        self.error = Some(Box::new(ParseError {
+            msg: format!("code error: unexpected keyword"),
+        }));
+
+        ParserState::End
     }
 
     fn reading_help(&mut self) -> ParserState<R> {
         println!("in reading_help");
 
         self.read_token_until_newline(true);
-        if let Some(_) = &self.error {
+        if self.got_error() {
             return ParserState::End;
         }
 
@@ -233,6 +243,37 @@ impl<R: Read> TextParser<R> {
 
     fn reading_type(&mut self) -> ParserState<R> {
         println!("in reading_type");
+
+        self.read_token_until_newline(false);
+
+        if self.got_error() {
+            return ParserState::End;
+        }
+
+        println!("get TYPE {}", str::from_utf8(&self.current_token).unwrap());
+
+        match str::from_utf8(&self.current_token) {
+            Ok("summary") => {
+                self.cur_mf_type = MetricType::SUMMARY;
+            }
+            Ok("counter") => {
+                self.cur_mf_type = MetricType::COUNTER;
+            }
+            Ok("gauge") => {
+                self.cur_mf_type = MetricType::GAUGE;
+            }
+            Ok("histogram") => {
+                self.cur_mf_type = MetricType::HISTOGRAM;
+            }
+            _ => {
+                self.cur_mf_type = MetricType::UNTYPED;
+            }
+        }
+
+        if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
+            mf.set_field_type(self.cur_mf_type);
+        }
+
         self.start_of_line()
     }
 
@@ -338,7 +379,7 @@ impl<R: Read> TextParser<R> {
         println!("in reading_metric_name");
         self.read_token_as_metric_name();
 
-        if let Some(_) = &self.error {
+        if self.got_error() {
             return ParserState::End;
         }
 
@@ -350,24 +391,113 @@ impl<R: Read> TextParser<R> {
 
         self.set_or_create_current_mf();
 
-        if let Some(_mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
-            // TODO: fix metric type here?
-            let _metric = Metric::new();
+        if let Some(_) = self.mf_by_name.get_mut(&self.cur_mf_name) {
+            self.cur_metrics.push(Metric::new());
+        }
+        self.reading_labels()
+    }
+
+    fn reading_labels(&mut self) -> ParserState<R> {
+        println!("in reading_labels");
+
+        if self.cur_mf_type == MetricType::HISTOGRAM || self.cur_mf_type == MetricType::SUMMARY {
+            self.current_labels.clear();
+            self.current_labels
+                .entry("__name__".to_string())
+                .or_insert(self.cur_mf_name.clone());
+            self.current_quantile = std::f64::NAN;
+            self.current_bucket = std::f64::NAN;
+        }
+
+        if self.current_byte != '{' as u8 {
+            return self.reading_value();
+        }
+
+        self.start_label_name()
+    }
+
+    fn reading_value(&mut self) -> ParserState<R> {
+        println!("in reading_value");
+
+        let mut last_metric = self.cur_metrics.pop();
+
+        if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
+            if self.cur_mf_type == MetricType::SUMMARY {
+            } else if self.cur_mf_type == MetricType::HISTOGRAM {
+            } else {
+                //mf.get_field_type()
+            }
+        }
+
+        self.read_token_until_white_space();
+        if self.got_error() {
+            return ParserState::End;
+        }
+
+        match parse_float(str::from_utf8(&self.current_token).unwrap()) {
+            Ok(float_val) => {
+                println!("get float {}", float_val);
+            }
+            Err(err) => {
+                self.error = Some(Box::new(err));
+            }
+        }
+
+        self.start_timestamp()
+    }
+
+    fn start_timestamp(&mut self) -> ParserState<R> {
+        self.start_of_line()
+    }
+
+    fn start_label_name(&mut self) -> ParserState<R> {
+        self.skip_blank_tab();
+        if self.got_error() {
+            return ParserState::End;
+        }
+
+        if self.current_byte == '}' as u8 {
+            self.skip_blank_tab();
+            if self.got_error() {
+                return ParserState::End;
+            }
+            return self.reading_value();
+        }
+
+        self.read_token_as_label_name();
+        if self.got_error() {
+            return ParserState::End;
+        }
+
+        if self.current_token.len() == 0 {
+            self.error = Some(Box::new(ParseError {
+                msg: format!("invalid label name for metric {}", self.cur_mf_name),
+            }));
+            return ParserState::End;
+        }
+
+        self.start_label_value();
+        if self.got_error() {
+            return ParserState::End;
         }
 
         ParserState::End
     }
 
-    fn reading_labels(&mut self) -> ParserState<R> {
-        self.start_label_name()
+    fn read_token_as_label_name(&mut self) -> ParserState<R> {
+        todo!();
+        ParserState::End
     }
 
-    fn start_label_name(&mut self) -> ParserState<R> {
-        self.start_label_value()
+    fn got_error(&self) -> bool {
+        if let Some(_) = &self.error {
+            return true;
+        }
+        return false;
     }
 
     fn start_label_value(&mut self) -> ParserState<R> {
-        todo!()
+        ParserState::End
     }
 
     fn read_token_until_white_space(&mut self) {
@@ -428,6 +558,11 @@ impl<R: Read> TextParser<R> {
             if let Some(_err) = &self.error {
                 return;
             }
+
+            //println!(
+            //    "read_token_until_newline: {}",
+            //    str::from_utf8(&self.current_token).unwrap()
+            //);
 
             if recognize_escape_seq && escaped {
                 match self.current_byte as char {
@@ -517,16 +652,26 @@ fn is_bucket(name: &str) -> bool {
     return name.ends_with("_bucket");
 }
 
+fn parse_float(s: &str) -> Result<f64, ParseFloatError> {
+    s.parse::<f64>()
+}
+
 #[cfg(test)]
 
 mod tests {
+
     use super::*;
+    use std::io::{BufReader, Cursor};
 
     #[test]
     fn test_basic_parse() {
         let cursor = Cursor::new(
             String::from(
                 r#"
+# HELP http_request_total The total number of HTTP requests.
+# TYPE http_request_total counter
+http_request_total{path="/api/v1",method="POST"} 1027
+http_request_total{path="/api/v1",method="GET"} 4711
 # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
 # TYPE http_request_duration_seconds summary
 http_request_duration_seconds{quantile="0.5"} 0.123
@@ -534,10 +679,6 @@ http_request_duration_seconds{quantile="0.9"} 0.456
 http_request_duration_seconds{quantile="0.99"} 0.789
 http_request_duration_seconds_sum 15.678
 http_request_duration_seconds_count 1000
-# HELP http_request_total The total number of HTTP requests.
-# TYPE http_request_total counter
-http_request_total{path="/api/v1",method="POST"} 1027
-http_request_total{path="/api/v1",method="GET"} 4711
 "#,
             )
             .into_bytes(),
