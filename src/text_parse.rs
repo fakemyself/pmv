@@ -27,7 +27,7 @@ impl Error for ParseError {
 }
 
 #[derive(Debug)]
-pub struct TextParser<R: Read> {
+pub struct TextParser<'a, R: Read> {
     cur_byte: u8,
 
     cur_labels: HashMap<String, String>,
@@ -47,20 +47,21 @@ pub struct TextParser<R: Read> {
     reader: R,
 
     cur_metrics: Vec<Metric>,
+
     cur_label_pair: Option<LabelPair>,
 
     error: Option<Box<dyn Error>>,
-    state_fn: StateFn<R>,
+    state_fn: StateFn<'a, R>,
 }
 
-type StateFn<R> = fn(&mut TextParser<R>) -> ParserState<R>;
+type StateFn<'a, R> = fn(&mut TextParser<'a, R>) -> ParserState<'a, R>;
 
-enum ParserState<R: Read> {
-    _Any(StateFn<R>),
+enum ParserState<'a, R: Read> {
+    _Any(StateFn<'a, R>),
     End,
 }
 
-impl<R: Read> TextParser<R> {
+impl<'a, R: Read> TextParser<'a, R> {
     pub fn new(reader: R) -> Self {
         TextParser {
             cur_labels: HashMap::new(),
@@ -101,7 +102,7 @@ impl<R: Read> TextParser<R> {
         Ok(HashMap::new()) // TODO: return empty
     }
 
-    fn start_of_line(&mut self) -> ParserState<R> {
+    fn start_of_line(&mut self) -> ParserState<'a, R> {
         debug!("in start_of_line");
 
         self.line_count += 1;
@@ -116,7 +117,7 @@ impl<R: Read> TextParser<R> {
         }
     }
 
-    fn start_comment(&mut self) -> ParserState<R> {
+    fn start_comment(&mut self) -> ParserState<'a, R> {
         debug!("in start_comment");
 
         self.skip_blank_tab();
@@ -211,7 +212,7 @@ impl<R: Read> TextParser<R> {
         ParserState::End
     }
 
-    fn reading_help(&mut self) -> ParserState<R> {
+    fn reading_help(&mut self) -> ParserState<'a, R> {
         debug!("in reading_help");
 
         self.read_token_until_newline(true);
@@ -246,7 +247,7 @@ impl<R: Read> TextParser<R> {
         self.start_of_line()
     }
 
-    fn reading_type(&mut self) -> ParserState<R> {
+    fn reading_type(&mut self) -> ParserState<'a, R> {
         debug!("in reading_type");
 
         self.read_token_until_newline(false);
@@ -377,7 +378,7 @@ impl<R: Read> TextParser<R> {
         );
     }
 
-    fn reading_metric_name(&mut self) -> ParserState<R> {
+    fn reading_metric_name(&mut self) -> ParserState<'a, R> {
         debug!("in reading_metric_name");
         self.read_token_as_metric_name();
 
@@ -399,7 +400,7 @@ impl<R: Read> TextParser<R> {
         self.reading_labels()
     }
 
-    fn reading_labels(&mut self) -> ParserState<R> {
+    fn reading_labels(&mut self) -> ParserState<'a, R> {
         debug!("in reading_labels");
 
         if self.cur_mf_type == MetricType::HISTOGRAM || self.cur_mf_type == MetricType::SUMMARY {
@@ -418,16 +419,16 @@ impl<R: Read> TextParser<R> {
         self.start_label_name()
     }
 
-    fn reading_value(&mut self) -> ParserState<R> {
+    fn reading_value(&mut self) -> ParserState<'a, R> {
         debug!("in reading_value");
 
-        let last_metric = self.cur_metrics.pop();
-
-        if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
-            if self.cur_mf_type == MetricType::SUMMARY {
-            } else if self.cur_mf_type == MetricType::HISTOGRAM {
-            } else {
-                //mf.get_field_type()
+        if let Some(last_metric) = self.cur_metrics.last() {
+            if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
+                if self.cur_mf_type == MetricType::SUMMARY {
+                } else if self.cur_mf_type == MetricType::HISTOGRAM {
+                } else {
+                    //mf.get_field_type()
+                }
             }
         }
 
@@ -448,11 +449,11 @@ impl<R: Read> TextParser<R> {
         self.start_timestamp()
     }
 
-    fn start_timestamp(&mut self) -> ParserState<R> {
+    fn start_timestamp(&mut self) -> ParserState<'a, R> {
         self.start_of_line()
     }
 
-    fn start_label_name(&mut self) -> ParserState<R> {
+    fn start_label_name(&mut self) -> ParserState<'a, R> {
         self.skip_blank_tab();
         if self.got_error() {
             return ParserState::End;
@@ -480,30 +481,34 @@ impl<R: Read> TextParser<R> {
         }
 
         let label_name = String::from_utf8(self.cur_token.clone()).unwrap();
-        let mut lp = LabelPair::new();
-        lp.set_name(label_name);
 
-        debug!("got label: {:?}", lp);
+        self.cur_label_pair = Some(LabelPair::new());
 
-        if lp.get_name() == "__name__" {
+        self.cur_label_pair.as_mut().unwrap().set_name(label_name);
+
+        debug!("got label: {:?}", self.cur_label_pair);
+
+        if self.cur_label_pair.as_ref().unwrap().get_name() == "__name__" {
             self.error = Some(Box::new(ParseError {
                 msg: format!("label name `__name__' is reserved"),
             }))
         }
 
         // Special for summary/histogram: Do not add 'quantile' and 'le' label to 'real' labels.
-        if (self.cur_mf_type == MetricType::SUMMARY && lp.get_name() == "quantile")
-            || (self.cur_mf_type == MetricType::HISTOGRAM && lp.get_name() == "le")
+        if (self.cur_mf_type == MetricType::SUMMARY
+            && self.cur_label_pair.as_ref().unwrap().get_name() == "quantile")
+            || (self.cur_mf_type == MetricType::HISTOGRAM
+                && self.cur_label_pair.as_ref().unwrap().get_name() == "le")
         {
-            if let Some(mut m) = self.cur_metrics.pop() {
-                debug!("add label pair: {:?}", lp);
-                m.mut_label().push(lp);
-                self.cur_metrics.push(m);
+            if let Some(m) = self.cur_metrics.last_mut() {
+                debug!("add label pair: {:?}", self.cur_label_pair);
+
+                if let Some(lp) = self.cur_label_pair.take() {
+                    m.mut_label().push(lp.clone());
+                }
 
                 debug!("cur_metrics: {:?}", self.cur_metrics);
             }
-        } else {
-            self.cur_label_pair = Some(lp);
         }
 
         self.skip_blank_tab_if_current_blank_tab();
@@ -554,7 +559,7 @@ impl<R: Read> TextParser<R> {
         return false;
     }
 
-    fn start_label_value(&mut self) -> ParserState<R> {
+    fn start_label_value(&mut self) -> ParserState<'a, R> {
         debug!("in start_label_value, cur_byte: {}", self.cur_byte as char);
 
         self.skip_blank_tab();
@@ -577,7 +582,7 @@ impl<R: Read> TextParser<R> {
             return ParserState::End;
         }
 
-        if let Some(mut lp) = self.cur_label_pair.as_mut() {
+        if let Some(lp) = self.cur_label_pair.as_mut() {
             lp.set_value(String::from_utf8(self.cur_token.clone()).unwrap());
             debug!("got label {:?} for metric", lp);
         }
@@ -586,15 +591,36 @@ impl<R: Read> TextParser<R> {
 
         // TODO: check token value is valid.
 
-        if let Some(mut m) = self.cur_metrics.pop() {
-            if let Some(mut lp) = m.mut_label().pop() {
-                lp.set_value(String::from_utf8(self.cur_token.clone()).unwrap());
-                debug!("metric: {:?}", m);
-            } else {
-                debug!("no LabelPair in metric {:?}", m);
+        match self.cur_mf_type {
+            MetricType::SUMMARY | MetricType::HISTOGRAM => {
+                if let Some(m) = self.cur_metrics.last() {
+                    if let Some(lp) = m.get_label().last() {
+                        debug!("label_pair: {:?}", lp);
+
+                        match lp.get_name() {
+                            "quantile" | "le" => {
+                                if let Err(e) = parse_float(lp.get_value()) {
+                                    debug!("parse_float: {}", e);
+
+                                    self.error = Some(Box::new(ParseError {
+                                        msg: format!(
+                                            "expect float as value for quantile lable, got {}",
+                                            lp.get_value(),
+                                        ),
+                                    }));
+                                    return ParserState::End;
+                                }
+                            }
+                            _ => {
+                                self.cur_labels
+                                    .insert(lp.get_name().to_string(), lp.get_value().to_string());
+                                debug!("cur_labels: {:?}", self.cur_labels);
+                            }
+                        }
+                    }
+                }
             }
-        } else {
-            debug!("no metric");
+            _ => {}
         }
 
         ParserState::End
@@ -842,10 +868,6 @@ mod tests {
         let cursor = Cursor::new(
             String::from(
                 r#"
-# HELP http_request_total The total number of HTTP requests.
-# TYPE http_request_total counter
-http_request_total{path="/api/v1",method="POST"} 1027
-http_request_total{path="/api/v1",method="GET"} 4711
 # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
 # TYPE http_request_duration_seconds summary
 http_request_duration_seconds{quantile="0.5"} 0.123
@@ -853,6 +875,10 @@ http_request_duration_seconds{quantile="0.9"} 0.456
 http_request_duration_seconds{quantile="0.99"} 0.789
 http_request_duration_seconds_sum 15.678
 http_request_duration_seconds_count 1000
+# HELP http_request_total The total number of HTTP requests.
+# TYPE http_request_total counter
+http_request_total{path="/api/v1",method="POST"} 1027
+http_request_total{path="/api/v1",method="GET"} 4711
 "#,
             )
             .into_bytes(),
