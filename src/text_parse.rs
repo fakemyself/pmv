@@ -27,7 +27,7 @@ impl Error for ParseError {
 }
 
 #[derive(Debug)]
-pub struct TextParser<'a, R: Read> {
+pub struct TextParser<R: Read> {
     cur_byte: u8,
 
     cur_labels: HashMap<String, String>,
@@ -51,17 +51,16 @@ pub struct TextParser<'a, R: Read> {
     cur_label_pair: Option<LabelPair>,
 
     error: Option<Box<dyn Error>>,
-    state_fn: StateFn<'a, R>,
 }
 
-type StateFn<'a, R> = fn(&mut TextParser<'a, R>) -> ParserState<'a, R>;
+type StateFn<R> = fn(&mut TextParser<R>) -> ParserState<R>;
 
-enum ParserState<'a, R: Read> {
-    _Any(StateFn<'a, R>),
+enum ParserState<R: Read> {
+    _Any(StateFn<R>),
     End,
 }
 
-impl<'a, R: Read> TextParser<'a, R> {
+impl<'a, R: Read> TextParser<R> {
     pub fn new(reader: R) -> Self {
         TextParser {
             cur_labels: HashMap::new(),
@@ -83,17 +82,18 @@ impl<'a, R: Read> TextParser<'a, R> {
             reader: reader,
             error: None,
             cur_label_pair: None,
-            state_fn: TextParser::start_of_line,
         }
     }
 
     pub fn text_to_metric_families(&mut self) -> Result<HashMap<String, MetricFamily>, io::Error> {
+        let mut next:StateFn<R>= TextParser::start_of_line;
         loop {
-            match (self.state_fn)(self) {
-                ParserState::_Any(next) => {
-                    self.state_fn = next;
+            match (next)(self) {
+                ParserState::_Any(x) => {
+                    next = x;
                 }
                 ParserState::End => {
+                    debug!("on exit");
                     break;
                 }
             }
@@ -102,7 +102,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         Ok(HashMap::new()) // TODO: return empty
     }
 
-    fn start_of_line(&mut self) -> ParserState<'a, R> {
+    fn start_of_line(&mut self) -> ParserState<R> {
         debug!("in start_of_line");
 
         self.line_count += 1;
@@ -117,7 +117,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         }
     }
 
-    fn start_comment(&mut self) -> ParserState<'a, R> {
+    fn start_comment(&mut self) -> ParserState<R> {
         debug!("in start_comment");
 
         self.skip_blank_tab();
@@ -212,7 +212,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         ParserState::End
     }
 
-    fn reading_help(&mut self) -> ParserState<'a, R> {
+    fn reading_help(&mut self) -> ParserState< R> {
         debug!("in reading_help");
 
         self.read_token_until_newline(true);
@@ -247,7 +247,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         self.start_of_line()
     }
 
-    fn reading_type(&mut self) -> ParserState<'a, R> {
+    fn reading_type(&mut self) -> ParserState<R> {
         debug!("in reading_type");
 
         self.read_token_until_newline(false);
@@ -378,7 +378,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         );
     }
 
-    fn reading_metric_name(&mut self) -> ParserState<'a, R> {
+    fn reading_metric_name(&mut self) -> ParserState<R> {
         debug!("in reading_metric_name");
         self.read_token_as_metric_name();
 
@@ -400,7 +400,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         self.reading_labels()
     }
 
-    fn reading_labels(&mut self) -> ParserState<'a, R> {
+    fn reading_labels(&mut self) -> ParserState<R> {
         debug!("in reading_labels");
 
         if self.cur_mf_type == MetricType::HISTOGRAM || self.cur_mf_type == MetricType::SUMMARY {
@@ -419,7 +419,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         self.start_label_name()
     }
 
-    fn reading_value(&mut self) -> ParserState<'a, R> {
+    fn reading_value(&mut self) -> ParserState<R> {
         debug!("in reading_value");
 
         if let Some(last_metric) = self.cur_metrics.last() {
@@ -449,11 +449,11 @@ impl<'a, R: Read> TextParser<'a, R> {
         self.start_timestamp()
     }
 
-    fn start_timestamp(&mut self) -> ParserState<'a, R> {
+    fn start_timestamp(&mut self) -> ParserState<R> {
         self.start_of_line()
     }
 
-    fn start_label_name(&mut self) -> ParserState<'a, R> {
+    fn start_label_name(&mut self) -> ParserState<R> {
         self.skip_blank_tab();
         if self.got_error() {
             return ParserState::End;
@@ -559,7 +559,7 @@ impl<'a, R: Read> TextParser<'a, R> {
         return false;
     }
 
-    fn start_label_value(&mut self) -> ParserState<'a, R> {
+    fn start_label_value(&mut self) -> ParserState<R> {
         debug!("in start_label_value, cur_byte: {}", self.cur_byte as char);
 
         self.skip_blank_tab();
