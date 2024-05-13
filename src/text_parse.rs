@@ -51,14 +51,15 @@ pub struct TextParser<R: Read> {
     cur_label_pair: Option<LabelPair>,
 
     error: Option<Box<dyn Error>>,
+    next_fn: Option<StateFn<R>>,
 }
 
-type StateFn<R> = fn(&mut TextParser<R>) -> ParserState<R>;
+type StateFn<R> = fn(&mut TextParser<R>);
 
-enum ParserState<R: Read> {
-    _Any(StateFn<R>),
-    End,
-}
+//enum ParserState<R: Read> {
+//    _Any(StateFn<R>),
+//    End,
+//}
 
 impl<'a, R: Read> TextParser<R> {
     pub fn new(reader: R) -> Self {
@@ -82,17 +83,18 @@ impl<'a, R: Read> TextParser<R> {
             reader: reader,
             error: None,
             cur_label_pair: None,
+            next_fn: None,
         }
     }
 
     pub fn text_to_metric_families(&mut self) -> Result<HashMap<String, MetricFamily>, io::Error> {
-        let mut next:StateFn<R>= TextParser::start_of_line;
+        self.next_fn = Some(TextParser::start_of_line);
         loop {
-            match (next)(self) {
-                ParserState::_Any(x) => {
-                    next = x;
+            match self.next_fn {
+                Some(next) => {
+                    next(self);
                 }
-                ParserState::End => {
+                None => {
                     debug!("on exit");
                     break;
                 }
@@ -102,40 +104,50 @@ impl<'a, R: Read> TextParser<R> {
         Ok(HashMap::new()) // TODO: return empty
     }
 
-    fn start_of_line(&mut self) -> ParserState<R> {
+    fn start_of_line(&mut self) {
         debug!("in start_of_line");
 
         self.line_count += 1;
         self.skip_blank_tab();
 
         match self.cur_byte as char {
-            '#' => self.start_comment(),
+            '#' => {
+                self.next_fn = Some(TextParser::start_comment);
+            }
 
-            '\n' => self.start_of_line(),
+            '\n' => {
+                self.next_fn = Some(TextParser::start_of_line);
+            }
 
-            _ => self.reading_metric_name(),
+            _ => {
+                self.next_fn = Some(TextParser::reading_metric_name);
+            }
         }
     }
 
-    fn start_comment(&mut self) -> ParserState<R> {
+    fn start_comment(&mut self) {
         debug!("in start_comment");
 
         self.skip_blank_tab();
         if let Some(_err) = &self.error {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_byte == '\n' as u8 {
-            return self.start_of_line();
+            self.next_fn = Some(TextParser::start_of_line);
+            return;
         }
 
         self.read_token_until_white_space();
         if let Some(_err) = &self.error {
-            return ParserState::End; // unexpected end of input.
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_byte == '\n' as u8 {
-            return self.start_of_line();
+            self.next_fn = Some(TextParser::start_of_line);
+            return;
         }
 
         let mut on_help = false;
@@ -155,13 +167,16 @@ impl<'a, R: Read> TextParser<R> {
                     }
 
                     if self.got_error() {
-                        return ParserState::End;
+                        self.next_fn = None;
+                        return;
                     }
 
                     self.read_byte()
                 }
-                return self.start_of_line();
+                self.next_fn = Some(TextParser::start_of_line);
+                return;
             }
+
             Err(e) => {
                 todo!("invalid UTF8 token: {}", e);
             }
@@ -170,54 +185,64 @@ impl<'a, R: Read> TextParser<R> {
         // there is something. Next has to be a metric name.
         self.skip_blank_tab();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         self.read_token_as_metric_name();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_byte == '\n' as u8 {
-            return self.start_of_line();
+            self.next_fn = Some(TextParser::start_of_line);
+            return;
         }
 
         if !is_blank_or_tab(self.cur_byte) {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         self.set_or_create_cur_mf();
 
         self.skip_blank_tab();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_byte == '\n' as u8 {
-            return self.start_of_line();
+            self.next_fn = Some(TextParser::start_of_line);
+            return;
         }
 
         if on_help {
-            return self.reading_help();
+            self.next_fn = Some(TextParser::reading_help);
+            return;
         }
 
         if on_type {
-            return self.reading_type();
+            self.next_fn = Some(TextParser::reading_type);
+            return;
         }
 
         self.error = Some(Box::new(ParseError {
             msg: format!("code error: unexpected keyword"),
         }));
 
-        ParserState::End
+        self.next_fn = None;
+        return;
     }
 
-    fn reading_help(&mut self) -> ParserState< R> {
+    fn reading_help(&mut self) {
         debug!("in reading_help");
 
         self.read_token_until_newline(true);
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
@@ -227,7 +252,8 @@ impl<'a, R: Read> TextParser<R> {
                 self.error = Some(Box::new(ParseError {
                     msg: format!("second HELP line for metric name {}", mf.get_name()),
                 }));
-                return ParserState::End;
+                self.next_fn = None;
+                return;
             }
 
             match String::from_utf8(self.cur_token.clone()) {
@@ -244,16 +270,18 @@ impl<'a, R: Read> TextParser<R> {
 
         debug!("mf_by_name(after set HELP): {:?}", self.mf_by_name);
 
-        self.start_of_line()
+        self.next_fn = Some(TextParser::start_of_line);
+        return;
     }
 
-    fn reading_type(&mut self) -> ParserState<R> {
+    fn reading_type(&mut self) {
         debug!("in reading_type");
 
         self.read_token_until_newline(false);
 
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         debug!("get TYPE {}", str::from_utf8(&self.cur_token).unwrap());
@@ -280,7 +308,8 @@ impl<'a, R: Read> TextParser<R> {
             mf.set_field_type(self.cur_mf_type);
         }
 
-        self.start_of_line()
+        self.next_fn = Some(TextParser::start_of_line);
+        return;
     }
 
     fn set_or_create_cur_mf(&mut self) {
@@ -378,18 +407,21 @@ impl<'a, R: Read> TextParser<R> {
         );
     }
 
-    fn reading_metric_name(&mut self) -> ParserState<R> {
+    fn reading_metric_name(&mut self) {
         debug!("in reading_metric_name");
         self.read_token_as_metric_name();
 
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_token.len() == 0 {
             self.error = Some(Box::new(ParseError {
                 msg: "invalid metric name".to_string(),
             }));
+            self.next_fn = None;
+            return;
         }
 
         self.set_or_create_cur_mf();
@@ -397,10 +429,12 @@ impl<'a, R: Read> TextParser<R> {
         if let Some(_) = self.mf_by_name.get_mut(&self.cur_mf_name) {
             self.cur_metrics.push(Metric::new());
         }
-        self.reading_labels()
+
+        self.next_fn = Some(TextParser::reading_labels);
+        return;
     }
 
-    fn reading_labels(&mut self) -> ParserState<R> {
+    fn reading_labels(&mut self) {
         debug!("in reading_labels");
 
         if self.cur_mf_type == MetricType::HISTOGRAM || self.cur_mf_type == MetricType::SUMMARY {
@@ -413,13 +447,15 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         if self.cur_byte != '{' as u8 {
-            return self.reading_value();
+            self.next_fn = Some(TextParser::reading_value);
+            return;
         }
 
-        self.start_label_name()
+        self.next_fn = Some(TextParser::start_label_name);
+        return;
     }
 
-    fn reading_value(&mut self) -> ParserState<R> {
+    fn reading_value(&mut self) {
         debug!("in reading_value");
 
         if let Some(last_metric) = self.cur_metrics.last() {
@@ -434,7 +470,8 @@ impl<'a, R: Read> TextParser<R> {
 
         self.read_token_until_white_space();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
@@ -449,35 +486,41 @@ impl<'a, R: Read> TextParser<R> {
         self.start_timestamp()
     }
 
-    fn start_timestamp(&mut self) -> ParserState<R> {
-        self.start_of_line()
+    fn start_timestamp(&mut self) {
+        todo!();
     }
 
-    fn start_label_name(&mut self) -> ParserState<R> {
+    fn start_label_name(&mut self) {
         self.skip_blank_tab();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_byte == '}' as u8 {
             self.skip_blank_tab();
             if self.got_error() {
-                return ParserState::End;
+                self.next_fn = None;
+                return;
             }
-            return self.reading_value();
+
+            self.next_fn = Some(TextParser::reading_value);
+            return;
         }
 
         self.read_token_as_label_name();
         if self.got_error() {
             error!("error after read_token_as_label_name");
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_token.len() == 0 {
             self.error = Some(Box::new(ParseError {
                 msg: format!("invalid label name for metric {}", self.cur_mf_name),
             }));
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         let label_name = String::from_utf8(self.cur_token.clone()).unwrap();
@@ -522,7 +565,8 @@ impl<'a, R: Read> TextParser<R> {
             }));
 
             debug!("on error {:?}", self.error);
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         // TODO: check duplicate label name.
@@ -559,12 +603,13 @@ impl<'a, R: Read> TextParser<R> {
         return false;
     }
 
-    fn start_label_value(&mut self) -> ParserState<R> {
+    fn start_label_value(&mut self) {
         debug!("in start_label_value, cur_byte: {}", self.cur_byte as char);
 
         self.skip_blank_tab();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if self.cur_byte != '"' as u8 {
@@ -574,12 +619,14 @@ impl<'a, R: Read> TextParser<R> {
                     self.cur_byte as char,
                 ),
             }));
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         self.read_token_as_label_value();
         if self.got_error() {
-            return ParserState::End;
+            self.next_fn = None;
+            return;
         }
 
         if let Some(lp) = self.cur_label_pair.as_mut() {
@@ -608,7 +655,8 @@ impl<'a, R: Read> TextParser<R> {
                                             lp.get_value(),
                                         ),
                                     }));
-                                    return ParserState::End;
+                                    self.next_fn = None;
+                                    return;
                                 }
                             }
                             _ => {
@@ -623,7 +671,8 @@ impl<'a, R: Read> TextParser<R> {
             _ => {}
         }
 
-        ParserState::End
+        self.next_fn = None;
+        return;
     }
 
     fn read_token_as_label_value(&mut self) {
