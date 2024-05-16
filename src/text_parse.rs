@@ -538,9 +538,9 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         // Special for summary/histogram: Do not add 'quantile' and 'le' label to 'real' labels.
-        if (self.cur_mf_type == MetricType::SUMMARY
+        if !(self.cur_mf_type == MetricType::SUMMARY
             && self.cur_label_pair.as_ref().unwrap().get_name() == "quantile")
-            || (self.cur_mf_type == MetricType::HISTOGRAM
+            && !(self.cur_mf_type == MetricType::HISTOGRAM
                 && self.cur_label_pair.as_ref().unwrap().get_name() == "le")
         {
             if let Some(m) = self.cur_metrics.last_mut() {
@@ -550,7 +550,10 @@ impl<'a, R: Read> TextParser<R> {
                     m.mut_label().push(lp.clone());
                 }
 
-                debug!("cur_metrics: {:?}", self.cur_metrics);
+                debug!(
+                    "cur_metrics: {:?}, cur_label_pair: {:?}",
+                    self.cur_metrics, self.cur_label_pair
+                );
             }
         }
 
@@ -629,50 +632,68 @@ impl<'a, R: Read> TextParser<R> {
             return;
         }
 
-        if let Some(lp) = self.cur_label_pair.as_mut() {
-            lp.set_value(String::from_utf8(self.cur_token.clone()).unwrap());
-            debug!("got label {:?} for metric", lp);
-        }
+        if let Some(m) = self.cur_metrics.last_mut() {
+            if let Some(lp) = m.mut_label().last_mut() {
+                lp.set_value(String::from_utf8(self.cur_token.clone()).unwrap());
 
-        debug!("cur_label_pair: {:?}", self.cur_label_pair);
+                debug!("lp: {:?}", lp);
 
-        // TODO: check token value is valid.
+                if self.cur_mf_type == MetricType::SUMMARY
+                    || self.cur_mf_type == MetricType::HISTOGRAM
+                {
+                    if lp.get_name() == "quantile" || lp.get_name() == "le" {
+                        // check if quantile/le float ok
+                        if let Err(e) = parse_float(str::from_utf8(&self.cur_token).unwrap()) {
+                            debug!("parse_float: {}", e);
 
-        match self.cur_mf_type {
-            MetricType::SUMMARY | MetricType::HISTOGRAM => {
-                if let Some(m) = self.cur_metrics.last() {
-                    if let Some(lp) = m.get_label().last() {
-                        debug!("label_pair: {:?}", lp);
-
-                        match lp.get_name() {
-                            "quantile" | "le" => {
-                                if let Err(e) = parse_float(lp.get_value()) {
-                                    debug!("parse_float: {}", e);
-
-                                    self.error = Some(Box::new(ParseError {
-                                        msg: format!(
-                                            "expect float as value for quantile lable, got {}",
-                                            lp.get_value(),
-                                        ),
-                                    }));
-                                    self.next_fn = None;
-                                    return;
-                                }
-                            }
-                            _ => {
-                                self.cur_labels
-                                    .insert(lp.get_name().to_string(), lp.get_value().to_string());
-                                debug!("cur_labels: {:?}", self.cur_labels);
-                            }
+                            self.error = Some(Box::new(ParseError {
+                                msg: format!(
+                                    "expect float as value for quantile lable, got {}",
+                                    lp.get_value(),
+                                ),
+                            }));
+                            self.next_fn = None;
+                            return;
                         }
                     }
+
+                    self.cur_labels
+                        .insert(lp.get_name().to_string(), lp.get_value().to_string());
                 }
+                debug!(
+                    "cur_labels: {:?}, mf_by_name: {:?}, lable pair: {:?}",
+                    self.cur_labels, self.mf_by_name, lp,
+                );
             }
-            _ => {}
         }
 
-        self.next_fn = None;
-        return;
+        self.skip_blank_tab();
+        if let Some(_err) = &self.error {
+            self.next_fn = None;
+            return;
+        }
+
+        match self.cur_byte as char {
+            ',' => {
+                self.next_fn = Some(TextParser::start_label_name);
+            }
+            '}' => {
+                self.skip_blank_tab();
+
+                if let Some(_err) = &self.error {
+                    self.next_fn = None;
+                    return;
+                }
+                self.next_fn = Some(TextParser::reading_value);
+            }
+            _ => {
+                self.next_fn = None;
+                self.error = Some(Box::new(ParseError {
+                    msg: format!("unexpected end of label value"),
+                }));
+                return;
+            }
+        }
     }
 
     fn read_token_as_label_value(&mut self) {
@@ -901,11 +922,11 @@ mod tests {
             .format(|buf, record| {
                 writeln!(
                     buf,
-                    "{}:{} {} [{}] - {}",
-                    record.file().unwrap_or("unknown"),
-                    record.line().unwrap_or(0),
+                    "{} [{}] {}:{} - {}",
                     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S"),
                     record.level(),
+                    record.file().unwrap_or("unknown"),
+                    record.line().unwrap_or(0),
                     record.args()
                 )
             })
@@ -917,6 +938,10 @@ mod tests {
         let cursor = Cursor::new(
             String::from(
                 r#"
+# HELP http_request_total The total number of HTTP requests.
+# TYPE http_request_total counter
+http_request_total{path="/api/v1",method="POST"} 1027
+http_request_total{path="/api/v1",method="GET"} 4711
 # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
 # TYPE http_request_duration_seconds summary
 http_request_duration_seconds{quantile="0.5"} 0.123
@@ -924,10 +949,6 @@ http_request_duration_seconds{quantile="0.9"} 0.456
 http_request_duration_seconds{quantile="0.99"} 0.789
 http_request_duration_seconds_sum 15.678
 http_request_duration_seconds_count 1000
-# HELP http_request_total The total number of HTTP requests.
-# TYPE http_request_total counter
-http_request_total{path="/api/v1",method="POST"} 1027
-http_request_total{path="/api/v1",method="GET"} 4711
 "#,
             )
             .into_bytes(),
