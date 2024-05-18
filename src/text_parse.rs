@@ -1,6 +1,6 @@
 use chrono;
 use log::{debug, error, LevelFilter};
-use prometheus::proto::{LabelPair, Metric, MetricFamily, MetricType};
+use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType, Quantile, Summary};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -38,10 +38,9 @@ pub struct TextParser<R: Read> {
     cur_token: Vec<u8>,
     cur_bucket: f64,
     cur_quantile: f64,
-    cur_is_summary_count: bool,
-    cur_is_summary_sum: bool,
-    cur_is_histogram_count: bool,
-    cur_is_histogram_sum: bool,
+
+    parser_status: Option<ParserStatus>,
+
     line_count: i32,
     reading_bytes: i32,
     reader: R,
@@ -56,10 +55,13 @@ pub struct TextParser<R: Read> {
 
 type StateFn<R> = fn(&mut TextParser<R>);
 
-//enum ParserState<R: Read> {
-//    _Any(StateFn<R>),
-//    End,
-//}
+#[derive(Debug)]
+enum ParserStatus {
+    OnSummaryCount,
+    OnSummarySum,
+    OnHistogramCount,
+    OnHistogramSum,
+}
 
 impl<'a, R: Read> TextParser<R> {
     pub fn new(reader: R) -> Self {
@@ -74,10 +76,9 @@ impl<'a, R: Read> TextParser<R> {
             cur_byte: 0 as u8,
             cur_bucket: 0.0,
             cur_quantile: 0.0,
-            cur_is_summary_count: false,
-            cur_is_summary_sum: false,
-            cur_is_histogram_count: false,
-            cur_is_histogram_sum: false,
+
+            parser_status: None,
+
             line_count: 0,
             reading_bytes: 0,
             reader: reader,
@@ -96,6 +97,12 @@ impl<'a, R: Read> TextParser<R> {
                 }
                 None => {
                     debug!("on exit");
+                    match &self.error {
+                        Some(err) => {
+                            error!("got error: {:?}", self.error);
+                        }
+                        None => {}
+                    }
                     break;
                 }
             }
@@ -313,10 +320,7 @@ impl<'a, R: Read> TextParser<R> {
     }
 
     fn set_or_create_cur_mf(&mut self) {
-        self.cur_is_summary_count = false;
-        self.cur_is_summary_sum = false;
-        self.cur_is_histogram_count = false;
-        self.cur_is_histogram_sum = false;
+        self.parser_status = None;
 
         match String::from_utf8(self.cur_token.clone()) {
             Ok(name) => {
@@ -334,11 +338,11 @@ impl<'a, R: Read> TextParser<R> {
 
                         if mf.get_field_type() == MetricType::SUMMARY {
                             if is_count(&name) {
-                                self.cur_is_summary_count = true;
+                                self.parser_status = Some(ParserStatus::OnSummaryCount);
                             }
 
                             if is_sum(&name) {
-                                self.cur_is_summary_sum = true;
+                                self.parser_status = Some(ParserStatus::OnSummarySum);
                             }
                             return;
                         }
@@ -352,11 +356,11 @@ impl<'a, R: Read> TextParser<R> {
                         self.cur_mf_name = histogram_name.to_string();
                         if mf.get_field_type() == MetricType::HISTOGRAM {
                             if is_count(&name) {
-                                self.cur_is_histogram_count = true
+                                self.parser_status = Some(ParserStatus::OnHistogramCount);
                             }
 
                             if is_sum(&name) {
-                                self.cur_is_histogram_sum = true
+                                self.parser_status = Some(ParserStatus::OnHistogramSum);
                             }
                             return;
                         }
@@ -474,6 +478,8 @@ impl<'a, R: Read> TextParser<R> {
             return;
         }
 
+        let float_val: f64 = 0.0;
+
         match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
             Ok(float_val) => {
                 debug!("get float {}", float_val);
@@ -481,6 +487,55 @@ impl<'a, R: Read> TextParser<R> {
             Err(err) => {
                 self.error = Some(Box::new(err));
             }
+        }
+
+        if let Some(m) = self.cur_metrics.last_mut() {
+            match self.cur_mf_type {
+                MetricType::COUNTER => {
+                    let mut cnt = Counter::new();
+                    cnt.set_value(float_val);
+                    m.set_counter(cnt);
+                }
+                MetricType::GAUGE => {
+                    todo!()
+                }
+
+                MetricType::SUMMARY => {
+                    let mut sum = Summary::new();
+
+                    match self.parser_status {
+                        Some(ParserStatus::OnSummaryCount) => {
+                            sum.set_sample_count(float_val as u64);
+                        }
+                        Some(ParserStatus::OnSummarySum) => {
+                            sum.set_sample_sum(float_val);
+                        }
+                        _ => {
+                            //let mut quantile = sum.get_quantile();
+                            let mut q = Quantile::new();
+                            q.set_quantile(self.cur_quantile);
+
+                            //quantile.push_back()
+
+                            self.error = Some(Box::new(
+                                    ParseError { msg: "expect parser status to be summary count or summary sum, got None or other invalid status".to_string(), }));
+                            self.next_fn = None;
+                            return;
+                        }
+                    }
+
+                    debug!("sum: {:?}, status: {:?}", sum, self.parser_status);
+                }
+                _ => {
+                    todo!();
+                }
+            }
+
+            debug!("metric: {:?}", m)
+        }
+
+        match self.cur_mf_type {
+            _ => {}
         }
 
         self.start_timestamp()
@@ -643,17 +698,22 @@ impl<'a, R: Read> TextParser<R> {
                 {
                     if lp.get_name() == "quantile" || lp.get_name() == "le" {
                         // check if quantile/le float ok
-                        if let Err(e) = parse_float(str::from_utf8(&self.cur_token).unwrap()) {
-                            debug!("parse_float: {}", e);
-
-                            self.error = Some(Box::new(ParseError {
-                                msg: format!(
-                                    "expect float as value for quantile lable, got {}",
-                                    lp.get_value(),
-                                ),
-                            }));
-                            self.next_fn = None;
-                            return;
+                        match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
+                            Err(e) => {
+                                debug!("parse_float: {}", e);
+                                self.error = Some(Box::new(ParseError {
+                                    msg: format!(
+                                        "expect float as value for quantile lable, got {}",
+                                        lp.get_value(),
+                                    ),
+                                }));
+                                self.next_fn = None;
+                                return;
+                            }
+                            Ok(v) => {
+                                debug!("get quantile {}", v);
+                                self.cur_quantile = v;
+                            }
                         }
                     }
 
@@ -912,7 +972,6 @@ fn parse_float(s: &str) -> Result<f64, ParseFloatError> {
 #[cfg(test)]
 
 mod tests {
-
     use super::*;
     use std::io::{BufReader, Cursor};
 
@@ -938,10 +997,6 @@ mod tests {
         let cursor = Cursor::new(
             String::from(
                 r#"
-# HELP http_request_total The total number of HTTP requests.
-# TYPE http_request_total counter
-http_request_total{path="/api/v1",method="POST"} 1027
-http_request_total{path="/api/v1",method="GET"} 4711
 # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
 # TYPE http_request_duration_seconds summary
 http_request_duration_seconds{quantile="0.5"} 0.123
@@ -949,6 +1004,10 @@ http_request_duration_seconds{quantile="0.9"} 0.456
 http_request_duration_seconds{quantile="0.99"} 0.789
 http_request_duration_seconds_sum 15.678
 http_request_duration_seconds_count 1000
+# HELP http_request_total The total number of HTTP requests.
+# TYPE http_request_total counter
+http_request_total{path="/api/v1",method="POST"} 1027
+http_request_total{path="/api/v1",method="GET"} 4711
 "#,
             )
             .into_bytes(),
