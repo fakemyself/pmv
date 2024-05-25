@@ -1,12 +1,14 @@
 use chrono;
 use log::{debug, error, LevelFilter};
 use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType, Quantile, Summary};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io::Write;
 use std::io::{self, Read};
 use std::num::ParseFloatError;
+use std::rc::Rc;
 use std::str;
 
 #[derive(Debug)]
@@ -31,8 +33,11 @@ pub struct TextParser<R: Read> {
     cur_byte: u8,
 
     cur_labels: HashMap<String, String>,
-    mf_by_name: HashMap<String, MetricFamily>,
-    cur_mf_name: String,
+
+    //mf_by_name: HashMap<String, MetricFamily>,
+    mf_by_name: HashMap<String, Rc<RefCell<MetricFamily>>>,
+    cur_mf: Rc<RefCell<MetricFamily>>,
+
     cur_mf_type: MetricType,
 
     cur_token: Vec<u8>,
@@ -46,7 +51,6 @@ pub struct TextParser<R: Read> {
     reader: R,
 
     cur_metrics: Vec<Metric>,
-
     cur_label_pair: Option<LabelPair>,
 
     error: Option<Box<dyn Error>>,
@@ -67,8 +71,10 @@ impl<'a, R: Read> TextParser<R> {
     pub fn new(reader: R) -> Self {
         TextParser {
             cur_labels: HashMap::new(),
+
             mf_by_name: HashMap::new(),
-            cur_mf_name: String::new(),
+            cur_mf: Rc::new(RefCell::new(MetricFamily::new())),
+
             cur_mf_type: MetricType::UNTYPED,
             cur_metrics: Vec::new(),
 
@@ -252,28 +258,26 @@ impl<'a, R: Read> TextParser<R> {
             return;
         }
 
-        if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
-            debug!("get mf for {}", self.cur_mf_name);
+        let mut mf = self.cur_mf.borrow_mut();
 
-            if mf.get_help().len() > 0 {
-                self.error = Some(Box::new(ParseError {
-                    msg: format!("second HELP line for metric name {}", mf.get_name()),
-                }));
-                self.next_fn = None;
-                return;
-            }
+        debug!("get mf for {}", mf.get_name());
 
-            match String::from_utf8(self.cur_token.clone()) {
-                Ok(s) => {
-                    mf.set_help(s);
-                }
-                Err(e) => {
-                    self.error = Some(Box::new(e));
-                }
-            };
-        } else {
-            debug!("mf {} not found", self.cur_mf_name);
+        if mf.get_help().len() > 0 {
+            self.error = Some(Box::new(ParseError {
+                msg: format!("second HELP line for metric name {}", mf.get_name()),
+            }));
+            self.next_fn = None;
+            return;
         }
+
+        match String::from_utf8(self.cur_token.clone()) {
+            Ok(s) => {
+                mf.set_help(s);
+            }
+            Err(e) => {
+                self.error = Some(Box::new(e));
+            }
+        };
 
         debug!("mf_by_name(after set HELP): {:?}", self.mf_by_name);
 
@@ -311,9 +315,7 @@ impl<'a, R: Read> TextParser<R> {
             }
         }
 
-        if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
-            mf.set_field_type(self.cur_mf_type);
-        }
+        self.cur_mf.borrow_mut().set_field_type(self.cur_mf_type);
 
         self.next_fn = Some(TextParser::start_of_line);
         return;
@@ -326,54 +328,41 @@ impl<'a, R: Read> TextParser<R> {
             Ok(name) => {
                 debug!("got name: {}", name);
 
-                if self.mf_by_name.contains_key(&name) {
-                    // key exist
-                    return;
-                }
+                //if self.mf_by_name.contains_key(&name) {
+                //    // key exist
+                //    return;
+                //}
 
                 let sum_name = summary_metric_name(&name);
-                match self.mf_by_name.get(sum_name) {
-                    Some(mf) => {
-                        self.cur_mf_name = sum_name.to_string();
+                let histogram_name = histogram_metric_name(&name);
 
+                if let mf = self.cur_mf.borrow() {
+                    if mf.get_name() == sum_name {
                         if mf.get_field_type() == MetricType::SUMMARY {
                             if is_count(&name) {
                                 self.parser_status = Some(ParserStatus::OnSummaryCount);
-                            }
-
-                            if is_sum(&name) {
+                            } else if is_sum(&name) {
                                 self.parser_status = Some(ParserStatus::OnSummarySum);
                             }
                             return;
                         }
-                    }
-                    _ => {}
-                }
-
-                let histogram_name = histogram_metric_name(&name);
-                match self.mf_by_name.get(histogram_name) {
-                    Some(mf) => {
-                        self.cur_mf_name = histogram_name.to_string();
-                        if mf.get_field_type() == MetricType::HISTOGRAM {
+                    } else if mf.get_name() == histogram_name {
+                        if mf.get_field_type() == MetricType::SUMMARY {
                             if is_count(&name) {
                                 self.parser_status = Some(ParserStatus::OnHistogramCount);
-                            }
-
-                            if is_sum(&name) {
+                            } else if is_sum(&name) {
                                 self.parser_status = Some(ParserStatus::OnHistogramSum);
                             }
                             return;
                         }
                     }
-                    _ => {}
                 }
 
                 debug!("add metric {}", name);
-                self.cur_mf_name = name.clone();
 
-                let mut mf = MetricFamily::new();
-                mf.set_name(name.clone());
-                self.mf_by_name.insert(name, mf);
+                self.cur_mf.borrow_mut().set_name(name.clone());
+
+                self.mf_by_name.insert(name, self.cur_mf.clone());
 
                 debug!("mf_by_name: {:?}", self.mf_by_name);
             }
@@ -430,9 +419,7 @@ impl<'a, R: Read> TextParser<R> {
 
         self.set_or_create_cur_mf();
 
-        if let Some(_) = self.mf_by_name.get_mut(&self.cur_mf_name) {
-            self.cur_metrics.push(Metric::new());
-        }
+        self.cur_metrics.push(Metric::new());
 
         self.next_fn = Some(TextParser::reading_labels);
         return;
@@ -445,7 +432,7 @@ impl<'a, R: Read> TextParser<R> {
             self.cur_labels.clear();
             self.cur_labels
                 .entry("__name__".to_string())
-                .or_insert(self.cur_mf_name.clone());
+                .or_insert(self.cur_mf.borrow().get_name().to_string());
             self.cur_quantile = std::f64::NAN;
             self.cur_bucket = std::f64::NAN;
         }
@@ -463,13 +450,19 @@ impl<'a, R: Read> TextParser<R> {
         debug!("in reading_value");
 
         if let Some(last_metric) = self.cur_metrics.last() {
-            if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
-                if self.cur_mf_type == MetricType::SUMMARY {
-                } else if self.cur_mf_type == MetricType::HISTOGRAM {
-                } else {
-                    //mf.get_field_type()
-                }
+            match self.cur_mf.borrow().get_field_type() {
+                MetricType::SUMMARY => {}
+                MetricType::HISTOGRAM => {}
+                _ => {}
             }
+
+            //if let Some(mf) = self.mf_by_name.get_mut(&self.cur_mf_name) {
+            //    if self.cur_mf_type == MetricType::SUMMARY {
+            //    } else if self.cur_mf_type == MetricType::HISTOGRAM {
+            //    } else {
+            //        //mf.get_field_type()
+            //    }
+            //}
         }
 
         self.read_token_until_white_space();
@@ -572,7 +565,10 @@ impl<'a, R: Read> TextParser<R> {
 
         if self.cur_token.len() == 0 {
             self.error = Some(Box::new(ParseError {
-                msg: format!("invalid label name for metric {}", self.cur_mf_name),
+                msg: format!(
+                    "invalid label name for metric {}",
+                    self.cur_mf.borrow().get_name()
+                ),
             }));
             self.next_fn = None;
             return;
