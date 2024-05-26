@@ -49,7 +49,7 @@ pub struct TextParser<R: Read> {
     reader: R,
 
     cur_metric: Option<Metric>,
-    cur_label_pair: Option<LabelPair>,
+    cur_label_pair_ref: Rc<RefCell<LabelPair>>,
 
     error: Option<Box<dyn Error>>,
     next_fn: Option<StateFn<R>>,
@@ -86,7 +86,7 @@ impl<'a, R: Read> TextParser<R> {
             reading_bytes: 0,
             reader: reader,
             error: None,
-            cur_label_pair: None,
+            cur_label_pair_ref: Rc::new(RefCell::new(LabelPair::new())),
             next_fn: None,
         }
     }
@@ -606,33 +606,32 @@ impl<'a, R: Read> TextParser<R> {
 
         let label_name = String::from_utf8(self.cur_token.clone()).unwrap();
 
-        self.cur_label_pair = Some(LabelPair::new());
+        let mut cur_lp= Some(LabelPair::new());
 
-        self.cur_label_pair.as_mut().unwrap().set_name(label_name);
+        cur_lp.as_mut().unwrap().set_name(label_name);
 
-        debug!("got label: {:?}", self.cur_label_pair);
+        debug!("got label: {:?}", cur_lp);
 
-        if self.cur_label_pair.as_ref().unwrap().get_name() == "__name__" {
+        if cur_lp.as_ref().unwrap().get_name() == "__name__" {
             self.error = Some(Box::new(ParseError {
                 msg: format!("label name `__name__' is reserved"),
             }))
         }
 
-
         // Special for summary/histogram: Do not add 'quantile' and 'le' label to 'real' labels.
         match self.cur_mf.borrow().get_field_type() {
             MetricType::SUMMARY | MetricType::HISTOGRAM => {} // pass
             _ => {
-                let lp_name = self.cur_label_pair.as_ref().unwrap().get_name();
+                let lp_name = cur_lp.as_ref().unwrap().get_name();
                 if lp_name != "le" && lp_name !="quantile" {
 
-                    debug!("cur-label-pair '{:?}'", self.cur_label_pair);
+                    debug!("cur-label-pair '{:?}'", cur_lp);
 
-                    self.cur_metric.as_mut().unwrap().mut_label().push(self.cur_label_pair.take().unwrap());
+                    self.cur_metric.as_mut().unwrap().mut_label().push(cur_lp.take().unwrap());
 
                     debug!(
                         "cur-metric: {:?}, cur-label-pair: {:?}",
-                        self.cur_metric, self.cur_label_pair
+                        self.cur_metric, cur_lp
                     );
                 }
             }
@@ -715,12 +714,21 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         // TODO: test if label value is valid.
-        self.cur_label_pair.as_mut().unwrap().set_value(String::from_utf8(self.cur_token.clone()).unwrap());
-        debug!("cur_label_pair: {:?}", self.cur_label_pair);
+        let mut cur_lp = self.cur_metric.as_mut().unwrap().mut_label().last_mut();
+        if !cur_lp.is_none() {
+            cur_lp.as_mut().unwrap().set_value(String::from_utf8(self.cur_token.clone()).unwrap());
+            debug!("cur-lp: {:?}", cur_lp);
+        } else {
+            self.error = Some(Box::new(ParseError{
+                msg: format!("expect current label pair not None"),
+            }));
+            self.next_fn=None;
+            return;
+        }
 
         match self.cur_mf.borrow().get_field_type() {
             MetricType::SUMMARY =>{
-                if self.cur_label_pair.as_ref().unwrap().get_name()  == "quantile" {
+                if cur_lp.as_ref().unwrap().get_name()  == "quantile" {
                     // check if quantile float ok
                     match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
                         Err(e) => {
@@ -728,7 +736,7 @@ impl<'a, R: Read> TextParser<R> {
                             self.error = Some(Box::new(ParseError {
                                 msg: format!(
                                     "expect float as value for quantile lable, got {}",
-                                    self.cur_label_pair.as_ref().unwrap().get_value(),
+                                    cur_lp.as_ref().unwrap().get_value(),
                                 ),
                             }));
                             self.next_fn = None;
@@ -741,14 +749,14 @@ impl<'a, R: Read> TextParser<R> {
                     }
                 } else {
                     self.cur_labels.insert(
-                    self.cur_label_pair.as_ref().unwrap().get_name().to_string(),
-                    self.cur_label_pair.as_ref().unwrap().get_value().to_string()
+                    cur_lp.as_ref().unwrap().get_name().to_string(),
+                    cur_lp.as_ref().unwrap().get_value().to_string()
                     );
                 }
             }
 
             MetricType::HISTOGRAM  => {
-                if self.cur_label_pair.as_ref().unwrap().get_name()  == "le"{
+                if cur_lp.as_ref().unwrap().get_name()  == "le"{
                     // check if 'le' float ok
                     match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
                         Err(e) => {
@@ -756,7 +764,7 @@ impl<'a, R: Read> TextParser<R> {
                             self.error = Some(Box::new(ParseError {
                                 msg: format!(
                                     "expect float as value for le lable, got {}",
-                                    self.cur_label_pair.as_ref().unwrap().get_value(),
+                                    cur_lp.as_ref().unwrap().get_value(),
                                 ),
                             }));
                             self.next_fn = None;
@@ -769,8 +777,8 @@ impl<'a, R: Read> TextParser<R> {
                     }
                 } else {
                     self.cur_labels.insert(
-                    self.cur_label_pair.as_ref().unwrap().get_name().to_string(),
-                    self.cur_label_pair.as_ref().unwrap().get_value().to_string()
+                    cur_lp.as_ref().unwrap().get_name().to_string(),
+                    cur_lp.as_ref().unwrap().get_value().to_string()
                     );
                 }
             }
@@ -780,7 +788,7 @@ impl<'a, R: Read> TextParser<R> {
 
         debug!(
             "cur_labels: {:?}, mf_by_name: {:?}, lable pair: {:?}",
-            self.cur_labels, self.mf_by_name, self.cur_label_pair.as_ref().unwrap(),
+            self.cur_labels, self.mf_by_name, cur_lp.as_ref().unwrap(),
         );
 
         self.skip_blank_tab();
