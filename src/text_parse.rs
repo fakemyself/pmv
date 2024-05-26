@@ -4,12 +4,12 @@ use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType, Qu
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
-use std::{default, fmt};
 use std::io::Write;
 use std::io::{self, Read};
 use std::num::ParseFloatError;
 use std::rc::Rc;
 use std::str;
+use std::{default, fmt};
 
 #[derive(Debug)]
 struct ParseError {
@@ -37,7 +37,6 @@ pub struct TextParser<R: Read> {
     mf_by_name: HashMap<String, Rc<RefCell<MetricFamily>>>,
     cur_mf: Rc<RefCell<MetricFamily>>,
 
-
     cur_token: Vec<u8>,
     cur_bucket: f64,
     cur_quantile: f64,
@@ -49,7 +48,7 @@ pub struct TextParser<R: Read> {
     reader: R,
 
     cur_metric: Option<Metric>,
-    cur_label_pair_ref: Rc<RefCell<LabelPair>>,
+    cur_lp: Option<LabelPair>,
 
     error: Option<Box<dyn Error>>,
     next_fn: Option<StateFn<R>>,
@@ -86,7 +85,7 @@ impl<'a, R: Read> TextParser<R> {
             reading_bytes: 0,
             reader: reader,
             error: None,
-            cur_label_pair_ref: Rc::new(RefCell::new(LabelPair::new())),
+            cur_lp: None,
             next_fn: None,
         }
     }
@@ -261,7 +260,11 @@ impl<'a, R: Read> TextParser<R> {
 
         if mf.get_help().len() > 0 {
             self.error = Some(Box::new(ParseError {
-                msg: format!("second HELP line for metric name {}", mf.get_name()),
+                msg: format!(
+                    "second HELP line for metric name {}, help: {}",
+                    mf.get_name(),
+                    mf.get_help()
+                ),
             }));
             self.next_fn = None;
             return;
@@ -305,7 +308,9 @@ impl<'a, R: Read> TextParser<R> {
                 self.cur_mf.borrow_mut().set_field_type(MetricType::GAUGE);
             }
             Ok("histogram") => {
-                self.cur_mf.borrow_mut().set_field_type(MetricType::HISTOGRAM);
+                self.cur_mf
+                    .borrow_mut()
+                    .set_field_type(MetricType::HISTOGRAM);
             }
             _ => {
                 self.cur_mf.borrow_mut().set_field_type(MetricType::UNTYPED);
@@ -423,7 +428,7 @@ impl<'a, R: Read> TextParser<R> {
 
         self.skip_blank_tab_if_current_blank_tab();
         if self.got_error() {
-            self.next_fn=None;
+            self.next_fn = None;
             return;
         }
 
@@ -445,13 +450,14 @@ impl<'a, R: Read> TextParser<R> {
 
                 debug!("cur_labels: {:?}", self.cur_labels);
             }
-            _=>{
-            }
+            _ => {}
         }
 
-
         if self.cur_byte != '{' as u8 {
-            debug!("got '{}', no label, directly reading value", self.cur_byte as char);
+            debug!(
+                "got '{}', no label, directly reading value",
+                self.cur_byte as char
+            );
             self.next_fn = Some(TextParser::reading_value);
             return;
         }
@@ -472,7 +478,9 @@ impl<'a, R: Read> TextParser<R> {
                 debug!("we are histo");
                 // TODO: append self.cur_metric to self.cur_mf
             }
-            _ => {todo!("append self.cur_metric to self.cur_mf");}
+            _ => {
+                todo!("append self.cur_metric to self.cur_mf");
+            }
         }
 
         self.read_token_until_white_space();
@@ -489,12 +497,12 @@ impl<'a, R: Read> TextParser<R> {
             Err(err) => {
                 error!("parse float: {}", err);
                 self.error = Some(Box::new(err));
-                self.next_fn=None;
+                self.next_fn = None;
                 return;
             }
         }
 
-        match self.cur_mf.borrow().get_field_type(){
+        match self.cur_mf.borrow().get_field_type() {
             MetricType::COUNTER => {
                 let mut cnt = Counter::new();
                 cnt.set_value(float_val);
@@ -504,35 +512,55 @@ impl<'a, R: Read> TextParser<R> {
             MetricType::GAUGE => {
                 todo!();
             }
-            MetricType::HISTOGRAM=> {
+            MetricType::HISTOGRAM => {
                 todo!();
             }
 
             MetricType::SUMMARY => {
                 if self.cur_metric.is_none() {
-                    self.cur_metric.as_mut().unwrap().set_summary(Summary::new());
+                    self.cur_metric
+                        .as_mut()
+                        .unwrap()
+                        .set_summary(Summary::new());
                 }
 
                 match self.parser_status {
                     Some(ParserStatus::OnSummaryCount) => {
                         debug!("set sample count: {}", float_val);
-                        self.cur_metric.as_mut().unwrap().mut_summary().set_sample_count(float_val as u64);
+                        self.cur_metric
+                            .as_mut()
+                            .unwrap()
+                            .mut_summary()
+                            .set_sample_count(float_val as u64);
                     }
                     Some(ParserStatus::OnSummarySum) => {
                         debug!("set sample sum: {}", float_val);
-                        self.cur_metric.as_mut().unwrap().mut_summary().set_sample_sum(float_val);
+                        self.cur_metric
+                            .as_mut()
+                            .unwrap()
+                            .mut_summary()
+                            .set_sample_sum(float_val);
                     }
                     _ => {
                         if self.cur_quantile != std::f64::NAN {
                             let mut q = Quantile::new();
                             q.set_quantile(self.cur_quantile);
-                            self.cur_metric.as_mut().unwrap().mut_summary().mut_quantile().push(q);
+                            self.cur_metric
+                                .as_mut()
+                                .unwrap()
+                                .mut_summary()
+                                .mut_quantile()
+                                .push(q);
                             debug!("cur_metric: {:?}", self.cur_metric);
                         }
                     }
                 }
 
-                debug!("sum: {:?}, status: {:?}", self.cur_metric.as_ref().unwrap().get_summary(), self.parser_status);
+                debug!(
+                    "sum: {:?}, status: {:?}",
+                    self.cur_metric.as_ref().unwrap().get_summary(),
+                    self.parser_status
+                );
                 debug!("cur_metric: {:?}", self.cur_metric);
             }
             MetricType::UNTYPED => {
@@ -540,13 +568,13 @@ impl<'a, R: Read> TextParser<R> {
             }
         }
 
-        if self.cur_byte == '\n' as u8{
+        if self.cur_byte == '\n' as u8 {
             self.next_fn = Some(Self::start_of_line);
-            return
+            return;
         } else {
             debug!("cur_byte: {}", self.cur_byte);
             self.next_fn = Some(Self::start_timestamp);
-            return
+            return;
         }
     }
 
@@ -606,13 +634,13 @@ impl<'a, R: Read> TextParser<R> {
 
         let label_name = String::from_utf8(self.cur_token.clone()).unwrap();
 
-        let mut cur_lp= Some(LabelPair::new());
+        self.cur_lp = Some(LabelPair::new());
 
-        cur_lp.as_mut().unwrap().set_name(label_name);
+        self.cur_lp.as_mut().unwrap().set_name(label_name);
 
-        debug!("got label: {:?}", cur_lp);
+        debug!("got label-pair: {:?}", self.cur_lp);
 
-        if cur_lp.as_ref().unwrap().get_name() == "__name__" {
+        if self.cur_lp.as_ref().unwrap().get_name() == "__name__" {
             self.error = Some(Box::new(ParseError {
                 msg: format!("label name `__name__' is reserved"),
             }))
@@ -620,18 +648,23 @@ impl<'a, R: Read> TextParser<R> {
 
         // Special for summary/histogram: Do not add 'quantile' and 'le' label to 'real' labels.
         match self.cur_mf.borrow().get_field_type() {
-            MetricType::SUMMARY | MetricType::HISTOGRAM => {} // pass
+            MetricType::SUMMARY | MetricType::HISTOGRAM => {
+                // TODO: what if other label-key that not 'quantile' and 'le'?
+            } // pass
             _ => {
-                let lp_name = cur_lp.as_ref().unwrap().get_name();
-                if lp_name != "le" && lp_name !="quantile" {
+                let lp_name = self.cur_lp.as_ref().unwrap().get_name();
+                if lp_name != "le" && lp_name != "quantile" {
+                    debug!("cur-label-pair '{:?}'", self.cur_lp);
 
-                    debug!("cur-label-pair '{:?}'", cur_lp);
-
-                    self.cur_metric.as_mut().unwrap().mut_label().push(cur_lp.take().unwrap());
+                    self.cur_metric
+                        .as_mut()
+                        .unwrap()
+                        .mut_label()
+                        .push(self.cur_lp.take().unwrap());
 
                     debug!(
                         "cur-metric: {:?}, cur-label-pair: {:?}",
-                        self.cur_metric, cur_lp
+                        self.cur_metric, self.cur_lp
                     );
                 }
             }
@@ -654,7 +687,7 @@ impl<'a, R: Read> TextParser<R> {
 
         // TODO: check duplicate label name.
 
-        self.next_fn=Some(Self::start_label_value);
+        self.next_fn = Some(Self::start_label_value);
         return;
     }
 
@@ -714,21 +747,27 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         // TODO: test if label value is valid.
-        let mut cur_lp = self.cur_metric.as_mut().unwrap().mut_label().last_mut();
-        if !cur_lp.is_none() {
-            cur_lp.as_mut().unwrap().set_value(String::from_utf8(self.cur_token.clone()).unwrap());
-            debug!("cur-lp: {:?}", cur_lp);
-        } else {
-            self.error = Some(Box::new(ParseError{
-                msg: format!("expect current label pair not None"),
-            }));
-            self.next_fn=None;
-            return;
+        match self.cur_metric.as_mut().unwrap().mut_label().last_mut() {
+            Some(mut cur_lp) => {
+                cur_lp.set_value(String::from_utf8(self.cur_token.clone()).unwrap());
+                debug!("cur-lp: {:?}", cur_lp);
+
+                self.cur_labels.insert(
+                    cur_lp.get_name().to_string(),
+                    cur_lp.get_value().to_string(),
+                );
+            }
+            None => {
+                debug!(
+                    "cur_lp not set for type {:?}",
+                    self.cur_mf.borrow().get_field_type()
+                );
+            }
         }
 
         match self.cur_mf.borrow().get_field_type() {
-            MetricType::SUMMARY =>{
-                if cur_lp.as_ref().unwrap().get_name()  == "quantile" {
+            MetricType::SUMMARY => {
+                if self.cur_lp.as_ref().unwrap().get_name() == "quantile" {
                     // check if quantile float ok
                     match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
                         Err(e) => {
@@ -736,7 +775,7 @@ impl<'a, R: Read> TextParser<R> {
                             self.error = Some(Box::new(ParseError {
                                 msg: format!(
                                     "expect float as value for quantile lable, got {}",
-                                    cur_lp.as_ref().unwrap().get_value(),
+                                    self.cur_lp.as_ref().unwrap().get_value(),
                                 ),
                             }));
                             self.next_fn = None;
@@ -747,16 +786,11 @@ impl<'a, R: Read> TextParser<R> {
                             self.cur_quantile = v;
                         }
                     }
-                } else {
-                    self.cur_labels.insert(
-                    cur_lp.as_ref().unwrap().get_name().to_string(),
-                    cur_lp.as_ref().unwrap().get_value().to_string()
-                    );
                 }
             }
 
-            MetricType::HISTOGRAM  => {
-                if cur_lp.as_ref().unwrap().get_name()  == "le"{
+            MetricType::HISTOGRAM => {
+                if self.cur_lp.as_ref().unwrap().get_name() == "le" {
                     // check if 'le' float ok
                     match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
                         Err(e) => {
@@ -764,7 +798,7 @@ impl<'a, R: Read> TextParser<R> {
                             self.error = Some(Box::new(ParseError {
                                 msg: format!(
                                     "expect float as value for le lable, got {}",
-                                    cur_lp.as_ref().unwrap().get_value(),
+                                    self.cur_lp.as_ref().unwrap().get_value(),
                                 ),
                             }));
                             self.next_fn = None;
@@ -775,20 +809,15 @@ impl<'a, R: Read> TextParser<R> {
                             self.cur_bucket = v;
                         }
                     }
-                } else {
-                    self.cur_labels.insert(
-                    cur_lp.as_ref().unwrap().get_name().to_string(),
-                    cur_lp.as_ref().unwrap().get_value().to_string()
-                    );
                 }
             }
 
-            _ =>{}
+            _ => {}
         }
 
         debug!(
             "cur_labels: {:?}, mf_by_name: {:?}, lable pair: {:?}",
-            self.cur_labels, self.mf_by_name, cur_lp.as_ref().unwrap(),
+            self.cur_labels, self.mf_by_name, self.cur_lp,
         );
 
         self.skip_blank_tab();
@@ -875,7 +904,10 @@ impl<'a, R: Read> TextParser<R> {
     }
 
     fn read_token_until_white_space(&mut self) {
-        debug!("in read-token-until-white-space, cur_byte: '{}'", self.cur_byte as char);
+        debug!(
+            "in read-token-until-white-space, cur_byte: '{}'",
+            self.cur_byte as char
+        );
         self.cur_token.clear();
         loop {
             if let Some(_err) = &self.error {
@@ -1057,6 +1089,13 @@ mod tests {
         let cursor = Cursor::new(
             String::from(
                 r#"
+# HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
+# TYPE http_request_duration_seconds summary
+http_request_duration_seconds{quantile="0.5"} 0.123
+http_request_duration_seconds{quantile="0.9"} 0.456
+http_request_duration_seconds{quantile="0.99"} 0.789
+http_request_duration_seconds_sum 15.678
+http_request_duration_seconds_count 1000
 # HELP http_request_total The total number of HTTP requests.
 # TYPE http_request_total counter
 http_request_total{path="/api/v1",method="POST"} 1027
@@ -1066,14 +1105,14 @@ http_request_total{path="/api/v1",method="GET"} 4711
             .into_bytes(),
         );
         /*
-# HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
-# TYPE http_request_duration_seconds summary
-http_request_duration_seconds{quantile="0.5"} 0.123
-http_request_duration_seconds{quantile="0.9"} 0.456
-http_request_duration_seconds{quantile="0.99"} 0.789
-http_request_duration_seconds_sum 15.678
-http_request_duration_seconds_count 1000
-        */
+        # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
+        # TYPE http_request_duration_seconds summary
+        http_request_duration_seconds{quantile="0.5"} 0.123
+        http_request_duration_seconds{quantile="0.9"} 0.456
+        http_request_duration_seconds{quantile="0.99"} 0.789
+        http_request_duration_seconds_sum 15.678
+        http_request_duration_seconds_count 1000
+                */
 
         let mut parser = TextParser::new(BufReader::new(cursor));
 
