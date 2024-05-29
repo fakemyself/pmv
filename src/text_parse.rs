@@ -1,6 +1,8 @@
 use chrono;
 use log::{debug, error, LevelFilter};
-use prometheus::proto::{Counter, LabelPair, Metric, MetricFamily, MetricType, Quantile, Summary};
+use prometheus::proto::{
+    Bucket, Counter, Histogram, LabelPair, Metric, MetricFamily, MetricType, Quantile, Summary,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
@@ -98,7 +100,7 @@ impl<'a, R: Read> TextParser<R> {
                     next(self);
                 }
                 None => {
-                    debug!("on exit");
+                    debug!("on exit. mf-by-name: {:?}", self.mf_by_name);
                     match &self.error {
                         Some(err) => {
                             error!("got error: {:?}", self.error);
@@ -118,6 +120,9 @@ impl<'a, R: Read> TextParser<R> {
 
         self.line_count += 1;
         self.skip_blank_tab();
+        if self.error.is_some() {
+            return;
+        }
 
         match self.cur_byte as char {
             '#' => {
@@ -182,8 +187,13 @@ impl<'a, R: Read> TextParser<R> {
 
                     self.read_byte()
                 }
-                self.next_fn = Some(TextParser::start_of_line);
-                return;
+
+                if self.next_fn.is_none() && self.error.is_some() {
+                    todo!("EOF");
+                } else {
+                    self.next_fn = Some(TextParser::start_of_line);
+                    return;
+                }
             }
 
             Err(e) => {
@@ -254,9 +264,12 @@ impl<'a, R: Read> TextParser<R> {
             return;
         }
 
+        // On new help, we think there is a new metric family comming.
+        self.cur_mf = Rc::new(RefCell::new(MetricFamily::new()));
+
         let mut mf = self.cur_mf.borrow_mut();
 
-        debug!("get mf for {}", mf.get_name());
+        debug!("get mf {:?}", mf);
 
         if mf.get_help().len() > 0 {
             self.error = Some(Box::new(ParseError {
@@ -469,7 +482,9 @@ impl<'a, R: Read> TextParser<R> {
     fn reading_value(&mut self) {
         debug!("in reading_value");
 
-        match self.cur_mf.borrow().get_field_type() {
+        let ftype = self.cur_mf.borrow().get_field_type();
+
+        match ftype {
             MetricType::SUMMARY => {
                 debug!("we are summary");
                 // TODO: append self.cur_metric to self.cur_mf
@@ -479,7 +494,14 @@ impl<'a, R: Read> TextParser<R> {
                 // TODO: append self.cur_metric to self.cur_mf
             }
             _ => {
-                todo!("append self.cur_metric to self.cur_mf");
+                debug!("append self.cur_metric to self.cur_mf");
+
+                match &self.cur_metric {
+                    None => {}
+                    Some(m) => {
+                        self.cur_mf.borrow_mut().take_metric().push(m.clone());
+                    }
+                }
             }
         }
 
@@ -509,11 +531,56 @@ impl<'a, R: Read> TextParser<R> {
                 self.cur_metric.as_mut().unwrap().set_counter(cnt);
                 debug!("metric: {:?}", self.cur_metric);
             }
+
             MetricType::GAUGE => {
-                todo!();
+                todo!("got gauge {:?}", self.cur_mf);
             }
+
             MetricType::HISTOGRAM => {
-                todo!();
+                if self.cur_metric.is_none() {
+                    self.cur_metric
+                        .as_mut()
+                        .unwrap()
+                        .set_histogram(Histogram::new());
+                }
+
+                match self.parser_status {
+                    Some(ParserStatus::OnHistogramCount) => {
+                        self.cur_metric
+                            .as_mut()
+                            .unwrap()
+                            .mut_histogram()
+                            .set_sample_count(float_val as u64);
+                    }
+                    Some(ParserStatus::OnHistogramSum) => {
+                        self.cur_metric
+                            .as_mut()
+                            .unwrap()
+                            .mut_histogram()
+                            .set_sample_sum(float_val);
+                    }
+                    _ => {
+                        if self.cur_bucket != std::f64::NAN {
+                            let mut bkt = Bucket::new();
+                            bkt.set_upper_bound(self.cur_bucket);
+                            bkt.set_cumulative_count(float_val as u64);
+                            debug!("set bucket: {:?}", bkt);
+                            self.cur_metric
+                                .as_mut()
+                                .unwrap()
+                                .mut_histogram()
+                                .mut_bucket()
+                                .push(bkt);
+                        }
+                    }
+                }
+
+                debug!(
+                    "histo: {:?}, status: {:?}",
+                    self.cur_metric.as_ref().unwrap().get_histogram(),
+                    self.parser_status
+                );
+                debug!("cur_metric: {:?}", self.cur_metric);
             }
 
             MetricType::SUMMARY => {
@@ -956,6 +1023,7 @@ impl<'a, R: Read> TextParser<R> {
             Err(err) => {
                 error!("read_exact: {:?}", err);
                 self.error = Some(Box::new(err));
+                self.next_fn = None
             }
         }
     }
@@ -1091,28 +1159,28 @@ mod tests {
                 r#"
 # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
 # TYPE http_request_duration_seconds summary
-http_request_duration_seconds{quantile="0.5"} 0.123
-http_request_duration_seconds{quantile="0.9"} 0.456
-http_request_duration_seconds{quantile="0.99"} 0.789
+http_request_duration_seconds{api="/v1/write", quantile="0.5"} 0.123
+http_request_duration_seconds{api="/v1/write", quantile="0.9"} 0.456
+http_request_duration_seconds{api="/v1/write", quantile="0.99"} 0.789
 http_request_duration_seconds_sum 15.678
 http_request_duration_seconds_count 1000
 # HELP http_request_total The total number of HTTP requests.
 # TYPE http_request_total counter
 http_request_total{path="/api/v1",method="POST"} 1027
 http_request_total{path="/api/v1",method="GET"} 4711
+# HELP http_request_duration_seconds Histogram of HTTP request latencies in seconds.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{api="/v1/write", le="0.1"} 100
+http_request_duration_seconds_bucket{api="/v1/write", le="0.2"} 250
+http_request_duration_seconds_bucket{api="/v1/write", le="0.5"} 500
+http_request_duration_seconds_bucket{api="/v1/write", le="1.0"} 700
+http_request_duration_seconds_bucket{api="/v1/write", le="+Inf"} 850
+http_request_duration_seconds_sum{api="/v1/write"} 52.3
+http_request_duration_seconds_count{api="/v1/write"} 850
 "#,
             )
             .into_bytes(),
         );
-        /*
-        # HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
-        # TYPE http_request_duration_seconds summary
-        http_request_duration_seconds{quantile="0.5"} 0.123
-        http_request_duration_seconds{quantile="0.9"} 0.456
-        http_request_duration_seconds{quantile="0.99"} 0.789
-        http_request_duration_seconds_sum 15.678
-        http_request_duration_seconds_count 1000
-                */
 
         let mut parser = TextParser::new(BufReader::new(cursor));
 
