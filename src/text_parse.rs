@@ -1,17 +1,16 @@
-use chrono;
-use log::{debug, error, LevelFilter};
+use log::{debug, error};
 use prometheus::proto::{
-    Bucket, Counter, Histogram, LabelPair, Metric, MetricFamily, MetricType, Quantile, Summary,
+    Bucket, Counter, Gauge, Histogram, LabelPair, Metric, MetricFamily, MetricType, Quantile,
+    Summary,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::Write;
+use std::fmt;
 use std::io::{self, Read};
 use std::num::ParseFloatError;
 use std::rc::Rc;
 use std::str;
-use std::{default, fmt};
 
 #[derive(Debug)]
 struct ParseError {
@@ -100,10 +99,12 @@ impl<'a, R: Read> TextParser<R> {
                     next(self);
                 }
                 None => {
-                    debug!("on exit. mf-by-name: {:?}", self.mf_by_name);
+                    for (k, v) in self.mf_by_name.iter() {
+                        debug!("=> {}: {:?}", k, v.borrow());
+                    }
                     match &self.error {
-                        Some(err) => {
-                            error!("got error: {:?}", self.error);
+                        Some(_err) => {
+                            error!("got error: {:?}", _err);
                         }
                         None => {}
                     }
@@ -326,7 +327,11 @@ impl<'a, R: Read> TextParser<R> {
                     .set_field_type(MetricType::HISTOGRAM);
             }
             _ => {
-                self.cur_mf.borrow_mut().set_field_type(MetricType::UNTYPED);
+                todo!(
+                    "token '{}' got unknown type",
+                    str::from_utf8(&self.cur_token).unwrap()
+                );
+                //self.cur_mf.borrow_mut().set_field_type(MetricType::UNTYPED);
             }
         }
 
@@ -354,31 +359,30 @@ impl<'a, R: Read> TextParser<R> {
                 let sum_name = summary_metric_name(&name);
                 let histogram_name = histogram_metric_name(&name);
 
-                if let mf = self.cur_mf.borrow() {
-                    if mf.get_name() == sum_name {
-                        if mf.get_field_type() == MetricType::SUMMARY {
-                            if is_count(&name) {
-                                self.parser_status = Some(ParserStatus::OnSummaryCount);
-                            } else if is_sum(&name) {
-                                self.parser_status = Some(ParserStatus::OnSummarySum);
-                            }
-                            return;
+                let mut mf = self.cur_mf.borrow_mut();
+                if mf.get_name() == sum_name {
+                    if mf.get_field_type() == MetricType::SUMMARY {
+                        if is_count(&name) {
+                            self.parser_status = Some(ParserStatus::OnSummaryCount);
+                        } else if is_sum(&name) {
+                            self.parser_status = Some(ParserStatus::OnSummarySum);
                         }
-                    } else if mf.get_name() == histogram_name {
-                        if mf.get_field_type() == MetricType::SUMMARY {
-                            if is_count(&name) {
-                                self.parser_status = Some(ParserStatus::OnHistogramCount);
-                            } else if is_sum(&name) {
-                                self.parser_status = Some(ParserStatus::OnHistogramSum);
-                            }
-                            return;
+                        return;
+                    }
+                } else if mf.get_name() == histogram_name {
+                    if mf.get_field_type() == MetricType::SUMMARY {
+                        if is_count(&name) {
+                            self.parser_status = Some(ParserStatus::OnHistogramCount);
+                        } else if is_sum(&name) {
+                            self.parser_status = Some(ParserStatus::OnHistogramSum);
                         }
+                        return;
                     }
                 }
 
                 debug!("add metric {}", name);
 
-                self.cur_mf.borrow_mut().set_name(name.clone());
+                mf.set_name(name.clone());
 
                 self.mf_by_name.insert(name, self.cur_mf.clone());
 
@@ -482,38 +486,16 @@ impl<'a, R: Read> TextParser<R> {
     fn reading_value(&mut self) {
         debug!("in reading_value");
 
-        let ftype = self.cur_mf.borrow().get_field_type();
-
-        match ftype {
-            MetricType::SUMMARY => {
-                debug!("we are summary");
-                // TODO: append self.cur_metric to self.cur_mf
-            }
-            MetricType::HISTOGRAM => {
-                debug!("we are histo");
-                // TODO: append self.cur_metric to self.cur_mf
-            }
-            _ => {
-                debug!("append self.cur_metric to self.cur_mf");
-
-                match &self.cur_metric {
-                    None => {}
-                    Some(m) => {
-                        self.cur_mf.borrow_mut().take_metric().push(m.clone());
-                    }
-                }
-            }
-        }
-
         self.read_token_until_white_space();
         if self.got_error() {
             self.next_fn = None;
             return;
         }
 
-        let float_val: f64 = 0.0;
+        let float_val: f64;
         match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
-            Ok(float_val) => {
+            Ok(f) => {
+                float_val = f;
                 debug!("get float {}", float_val);
             }
             Err(err) => {
@@ -529,11 +511,14 @@ impl<'a, R: Read> TextParser<R> {
                 let mut cnt = Counter::new();
                 cnt.set_value(float_val);
                 self.cur_metric.as_mut().unwrap().set_counter(cnt);
-                debug!("metric: {:?}", self.cur_metric);
+                debug!("get counter: {:?}", self.cur_metric);
             }
 
             MetricType::GAUGE => {
-                todo!("got gauge {:?}", self.cur_mf);
+                let mut gauge = Gauge::new();
+                gauge.set_value(float_val);
+                self.cur_metric.as_mut().unwrap().set_gauge(gauge);
+                debug!("get gauge {:?}", self.cur_metric);
             }
 
             MetricType::HISTOGRAM => {
@@ -628,10 +613,37 @@ impl<'a, R: Read> TextParser<R> {
                     self.cur_metric.as_ref().unwrap().get_summary(),
                     self.parser_status
                 );
-                debug!("cur_metric: {:?}", self.cur_metric);
             }
             MetricType::UNTYPED => {
-                todo!();
+                todo!("");
+            }
+        }
+
+        debug!("cur_metric: {:?}", self.cur_metric.as_ref().unwrap());
+
+        let ftype = self.cur_mf.borrow().get_field_type();
+
+        match ftype {
+            MetricType::SUMMARY => {
+                debug!("we are summary");
+                // TODO: append self.cur_metric to self.cur_mf
+            }
+            MetricType::HISTOGRAM => {
+                debug!("we are histo");
+                // TODO: append self.cur_metric to self.cur_mf
+            }
+            _ => {
+                debug!(
+                    "on {:?}, append cur-metric{:?} to self.cur_mf",
+                    ftype, self.cur_metric
+                );
+
+                match &self.cur_metric {
+                    None => {}
+                    Some(m) => {
+                        self.cur_mf.borrow_mut().mut_metric().push(m.clone());
+                    }
+                }
             }
         }
 
@@ -815,7 +827,7 @@ impl<'a, R: Read> TextParser<R> {
 
         // TODO: test if label value is valid.
         match self.cur_metric.as_mut().unwrap().mut_label().last_mut() {
-            Some(mut cur_lp) => {
+            Some(cur_lp) => {
                 cur_lp.set_value(String::from_utf8(self.cur_token.clone()).unwrap());
                 debug!("cur-lp: {:?}", cur_lp);
 
@@ -1133,6 +1145,9 @@ fn parse_float(s: &str) -> Result<f64, ParseFloatError> {
 
 mod tests {
     use super::*;
+    use chrono;
+    use log::LevelFilter;
+    use std::io::Write;
     use std::io::{BufReader, Cursor};
 
     #[test]
@@ -1157,26 +1172,37 @@ mod tests {
         let cursor = Cursor::new(
             String::from(
                 r#"
-# HELP http_request_duration_seconds Summary of HTTP request durations in seconds.
-# TYPE http_request_duration_seconds summary
-http_request_duration_seconds{api="/v1/write", quantile="0.5"} 0.123
-http_request_duration_seconds{api="/v1/write", quantile="0.9"} 0.456
-http_request_duration_seconds{api="/v1/write", quantile="0.99"} 0.789
-http_request_duration_seconds_sum 15.678
-http_request_duration_seconds_count 1000
-# HELP http_request_total The total number of HTTP requests.
-# TYPE http_request_total counter
-http_request_total{path="/api/v1",method="POST"} 1027
-http_request_total{path="/api/v1",method="GET"} 4711
-# HELP http_request_duration_seconds Histogram of HTTP request latencies in seconds.
-# TYPE http_request_duration_seconds histogram
-http_request_duration_seconds_bucket{api="/v1/write", le="0.1"} 100
-http_request_duration_seconds_bucket{api="/v1/write", le="0.2"} 250
-http_request_duration_seconds_bucket{api="/v1/write", le="0.5"} 500
-http_request_duration_seconds_bucket{api="/v1/write", le="1.0"} 700
-http_request_duration_seconds_bucket{api="/v1/write", le="+Inf"} 850
-http_request_duration_seconds_sum{api="/v1/write"} 52.3
-http_request_duration_seconds_count{api="/v1/write"} 850
+# HELP http2_request_duration_seconds Histogram of HTTP request latencies in seconds.
+# TYPE http2_request_duration_seconds histogram
+http2_request_duration_seconds_bucket{api="/v1/write", le="0.1"} 100
+http2_request_duration_seconds_bucket{api="/v1/write", le="0.2"} 250
+http2_request_duration_seconds_bucket{api="/v1/write", le="0.5"} 500
+http2_request_duration_seconds_bucket{api="/v1/write", le="1.0"} 700
+http2_request_duration_seconds_bucket{api="/v1/write", le="+Inf"} 850
+http2_request_duration_seconds_sum{api="/v1/write"} 52.3
+http2_request_duration_seconds_count{api="/v1/write"} 850
+# HELP some_counter Some counter.
+# TYPE some_counter counter
+some_counter{path="/api/v1",method="POST"} 1027
+some_counter{path="/api/v1",method="GET"} 4711
+# HELP some_gauge Some gauge.
+# TYPE some_gauge gauge
+some_gauge{path="/api/v1",method="POST"} 1028
+some_gauge{path="/api/v1",method="GET"} 4712
+# HELP api_latency_seconds HTTP request latency partitioned by HTTP API and HTTP status
+# TYPE api_latency_seconds summary
+api_latency_seconds{api="/v1/pull",status="url-error",quantile="0.5"} 0.000952746
+api_latency_seconds{api="/v1/pull",status="url-error",quantile="0.9"} 0.00546789
+api_latency_seconds{api="/v1/pull",status="url-error",quantile="0.99"} 0.009414857
+api_latency_seconds_sum{api="/v1/pull",status="url-error"} 0.1711532899999999
+api_latency_seconds_count{api="/v1/pull",status="url-error"} 104
+api_latency_seconds{api="/v1/usage_trace",status="url-error",quantile="0.5"} 0.000855108
+api_latency_seconds{api="/v1/usage_trace",status="url-error",quantile="0.9"} 0.001084062
+api_latency_seconds{api="/v1/usage_trace",status="url-error",quantile="0.99"} 0.001084062
+api_latency_seconds_sum{api="/v1/usage_trace",status="url-error"} 0.0032156570000000002
+api_latency_seconds_count{api="/v1/usage_trace",status="url-error"} 4
+api_latency_seconds{api="/v1/drop",status="url-error",quantile="0.5"} 0.000979155
+api_latency_seconds{api="/v1/drop",status="url-error",quantile="0.9"} 0.006829465
 "#,
             )
             .into_bytes(),
