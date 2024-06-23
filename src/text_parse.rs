@@ -79,7 +79,6 @@ impl<'a, R: Read> TextParser<R> {
             cur_byte: 0 as u8,
             cur_bucket: 0.0,
             cur_quantile: 0.0,
-
             parser_status: None,
 
             line_count: 0,
@@ -100,7 +99,17 @@ impl<'a, R: Read> TextParser<R> {
                 }
                 None => {
                     for (k, v) in self.mf_by_name.iter() {
-                        debug!("=> {}: {:?}", k, v.borrow());
+                        debug!(
+                            "=> {}: {}/{:?}: {}",
+                            k,
+                            v.borrow().get_name(),
+                            v.borrow().get_field_type(),
+                            v.borrow().get_help(),
+                        );
+
+                        for m in v.borrow().get_metric() {
+                            debug!("\t {:?}", m);
+                        }
                     }
                     match &self.error {
                         Some(_err) => {
@@ -344,7 +353,7 @@ impl<'a, R: Read> TextParser<R> {
 
         match String::from_utf8(self.cur_token.clone()) {
             Ok(name) => {
-                debug!("got name: {}", name);
+                debug!("get name: {}, cur-metric: {:?}", name, self.cur_metric);
 
                 if self.cur_mf.borrow().get_name() == name {
                     debug!("name {} exist, skipped", name);
@@ -356,12 +365,12 @@ impl<'a, R: Read> TextParser<R> {
                 //    return;
                 //}
 
-                let sum_name = summary_metric_name(&name);
-                let histogram_name = histogram_metric_name(&name);
-
                 let mut mf = self.cur_mf.borrow_mut();
-                if mf.get_name() == sum_name {
-                    if mf.get_field_type() == MetricType::SUMMARY {
+                let mf_type = mf.get_field_type();
+                debug!("name: {}, cur-mf name: {}", name, mf.get_name(),);
+
+                if mf_type == MetricType::SUMMARY {
+                    if mf.get_name() == summary_metric_name(&name) {
                         if is_count(&name) {
                             self.parser_status = Some(ParserStatus::OnSummaryCount);
                         } else if is_sum(&name) {
@@ -369,8 +378,8 @@ impl<'a, R: Read> TextParser<R> {
                         }
                         return;
                     }
-                } else if mf.get_name() == histogram_name {
-                    if mf.get_field_type() == MetricType::SUMMARY {
+                } else if mf_type == MetricType::HISTOGRAM {
+                    if mf.get_name() == histogram_metric_name(&name) {
                         if is_count(&name) {
                             self.parser_status = Some(ParserStatus::OnHistogramCount);
                         } else if is_sum(&name) {
@@ -383,9 +392,7 @@ impl<'a, R: Read> TextParser<R> {
                 debug!("add metric {}", name);
 
                 mf.set_name(name.clone());
-
                 self.mf_by_name.insert(name, self.cur_mf.clone());
-
                 debug!("mf-by-name: {:?}", self.mf_by_name);
             }
             Err(err) => {
@@ -465,7 +472,7 @@ impl<'a, R: Read> TextParser<R> {
                 self.cur_quantile = std::f64::NAN;
                 self.cur_bucket = std::f64::NAN;
 
-                debug!("cur_labels: {:?}", self.cur_labels);
+                debug!("cur-labels: {:?}", self.cur_labels);
             }
             _ => {}
         }
@@ -480,11 +487,13 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         self.next_fn = Some(TextParser::start_label_name);
+
+        debug!("cur-metric: {:?}", self.cur_metric);
         return;
     }
 
     fn reading_value(&mut self) {
-        debug!("in reading_value");
+        debug!("in reading-value, cur-metric: {:?}", self.cur_metric);
 
         self.read_token_until_white_space();
         if self.got_error() {
@@ -506,12 +515,21 @@ impl<'a, R: Read> TextParser<R> {
             }
         }
 
-        match self.cur_mf.borrow().get_field_type() {
+        let mftype = self.cur_mf.borrow().get_field_type();
+
+        match mftype {
             MetricType::COUNTER => {
                 let mut cnt = Counter::new();
                 cnt.set_value(float_val);
                 self.cur_metric.as_mut().unwrap().set_counter(cnt);
                 debug!("get counter: {:?}", self.cur_metric);
+
+                match &self.cur_metric {
+                    None => {}
+                    Some(m) => {
+                        self.cur_mf.borrow_mut().mut_metric().push(m.clone());
+                    }
+                }
             }
 
             MetricType::GAUGE => {
@@ -519,6 +537,13 @@ impl<'a, R: Read> TextParser<R> {
                 gauge.set_value(float_val);
                 self.cur_metric.as_mut().unwrap().set_gauge(gauge);
                 debug!("get gauge {:?}", self.cur_metric);
+
+                match &self.cur_metric {
+                    None => {}
+                    Some(m) => {
+                        self.cur_mf.borrow_mut().mut_metric().push(m.clone());
+                    }
+                }
             }
 
             MetricType::HISTOGRAM => {
@@ -528,6 +553,8 @@ impl<'a, R: Read> TextParser<R> {
                         .unwrap()
                         .set_histogram(Histogram::new());
                 }
+
+                debug!("parser-status: {:?}", self.parser_status);
 
                 match self.parser_status {
                     Some(ParserStatus::OnHistogramCount) => {
@@ -565,7 +592,14 @@ impl<'a, R: Read> TextParser<R> {
                     self.cur_metric.as_ref().unwrap().get_histogram(),
                     self.parser_status
                 );
-                debug!("cur_metric: {:?}", self.cur_metric);
+                debug!("get histo: {:?}", self.cur_metric);
+
+                match &self.cur_metric {
+                    None => {}
+                    Some(m) => {
+                        self.cur_mf.borrow_mut().mut_metric().push(m.clone());
+                    }
+                }
             }
 
             MetricType::SUMMARY => {
@@ -609,33 +643,9 @@ impl<'a, R: Read> TextParser<R> {
                 }
 
                 debug!(
-                    "sum: {:?}, status: {:?}",
+                    "get summary: {:?}, status: {:?}",
                     self.cur_metric.as_ref().unwrap().get_summary(),
                     self.parser_status
-                );
-            }
-            MetricType::UNTYPED => {
-                todo!("");
-            }
-        }
-
-        debug!("cur_metric: {:?}", self.cur_metric.as_ref().unwrap());
-
-        let ftype = self.cur_mf.borrow().get_field_type();
-
-        match ftype {
-            MetricType::SUMMARY => {
-                debug!("we are summary");
-                // TODO: append self.cur_metric to self.cur_mf
-            }
-            MetricType::HISTOGRAM => {
-                debug!("we are histo");
-                // TODO: append self.cur_metric to self.cur_mf
-            }
-            _ => {
-                debug!(
-                    "on {:?}, append cur-metric{:?} to self.cur_mf",
-                    ftype, self.cur_metric
                 );
 
                 match &self.cur_metric {
@@ -645,7 +655,13 @@ impl<'a, R: Read> TextParser<R> {
                     }
                 }
             }
+            MetricType::UNTYPED => {
+                todo!("");
+            }
         }
+
+        debug!("cur_metric: {:?}", self.cur_metric.as_ref().unwrap());
+        // TODO: should we clear self.cur_metric?
 
         if self.cur_byte == '\n' as u8 {
             self.next_fn = Some(Self::start_of_line);
@@ -767,6 +783,8 @@ impl<'a, R: Read> TextParser<R> {
         // TODO: check duplicate label name.
 
         self.next_fn = Some(Self::start_label_value);
+
+        debug!("cur-metric: {:?}", self.cur_metric);
         return;
     }
 
@@ -825,6 +843,8 @@ impl<'a, R: Read> TextParser<R> {
             return;
         }
 
+        debug!("cur-metric: {:?}", self.cur_metric);
+
         // TODO: test if label value is valid.
         match self.cur_metric.as_mut().unwrap().mut_label().last_mut() {
             Some(cur_lp) => {
@@ -838,7 +858,7 @@ impl<'a, R: Read> TextParser<R> {
             }
             None => {
                 debug!(
-                    "cur_lp not set for type {:?}",
+                    "cur-lp not set for type {:?}",
                     self.cur_mf.borrow().get_field_type()
                 );
             }
