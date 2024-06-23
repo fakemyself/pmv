@@ -49,8 +49,6 @@ pub struct TextParser<R: Read> {
     reader: R,
 
     cur_metric: Option<Metric>,
-    cur_lp: Option<LabelPair>,
-
     error: Option<Box<dyn Error>>,
     next_fn: Option<StateFn<R>>,
 }
@@ -85,7 +83,6 @@ impl<'a, R: Read> TextParser<R> {
             reading_bytes: 0,
             reader: reader,
             error: None,
-            cur_lp: None,
             next_fn: None,
         }
     }
@@ -113,7 +110,7 @@ impl<'a, R: Read> TextParser<R> {
                     }
                     match &self.error {
                         Some(_err) => {
-                            error!("got error: {:?}", _err);
+                            error!("get error: {:?}", _err);
                         }
                         None => {}
                     }
@@ -413,12 +410,12 @@ impl<'a, R: Read> TextParser<R> {
             self.read_byte();
 
             if let Some(_err) = &self.error {
-                debug!("got error: {:?}", self.error);
+                debug!("get error: {:?}", self.error);
                 break;
             }
 
             if !is_valid_label_name_continuation(self.cur_byte as char) {
-                debug!("got char: {}", self.cur_byte as char);
+                debug!("get char: {}", self.cur_byte as char);
                 break;
             }
         }
@@ -479,7 +476,7 @@ impl<'a, R: Read> TextParser<R> {
 
         if self.cur_byte != '{' as u8 {
             debug!(
-                "got '{}', no label, directly reading value",
+                "get '{}', no label, directly reading value",
                 self.cur_byte as char
             );
             self.next_fn = Some(TextParser::reading_value);
@@ -576,7 +573,9 @@ impl<'a, R: Read> TextParser<R> {
                             let mut bkt = Bucket::new();
                             bkt.set_upper_bound(self.cur_bucket);
                             bkt.set_cumulative_count(float_val as u64);
+
                             debug!("set bucket: {:?}", bkt);
+
                             self.cur_metric
                                 .as_mut()
                                 .unwrap()
@@ -631,6 +630,10 @@ impl<'a, R: Read> TextParser<R> {
                         if self.cur_quantile != std::f64::NAN {
                             let mut q = Quantile::new();
                             q.set_quantile(self.cur_quantile);
+                            q.set_value(float_val);
+
+                            debug!("set quantile: {:?}", q);
+
                             self.cur_metric
                                 .as_mut()
                                 .unwrap()
@@ -729,41 +732,20 @@ impl<'a, R: Read> TextParser<R> {
 
         let label_name = String::from_utf8(self.cur_token.clone()).unwrap();
 
-        self.cur_lp = Some(LabelPair::new());
+        let mut cur_lp = LabelPair::new();
 
-        self.cur_lp.as_mut().unwrap().set_name(label_name);
+        cur_lp.set_name(label_name);
 
-        debug!("got label-pair: {:?}", self.cur_lp);
+        debug!("get label-pair: {:?}", cur_lp);
 
-        if self.cur_lp.as_ref().unwrap().get_name() == "__name__" {
+        if cur_lp.get_name() == "__name__" {
             self.error = Some(Box::new(ParseError {
                 msg: format!("label name `__name__' is reserved"),
             }))
         }
 
-        // Special for summary/histogram: Do not add 'quantile' and 'le' label to 'real' labels.
-        match self.cur_mf.borrow().get_field_type() {
-            MetricType::SUMMARY | MetricType::HISTOGRAM => {
-                // TODO: what if other label-key that not 'quantile' and 'le'?
-            } // pass
-            _ => {
-                let lp_name = self.cur_lp.as_ref().unwrap().get_name();
-                if lp_name != "le" && lp_name != "quantile" {
-                    debug!("cur-label-pair '{:?}'", self.cur_lp);
-
-                    self.cur_metric
-                        .as_mut()
-                        .unwrap()
-                        .mut_label()
-                        .push(self.cur_lp.take().unwrap());
-
-                    debug!(
-                        "cur-metric: {:?}, cur-label-pair: {:?}",
-                        self.cur_metric, self.cur_lp
-                    );
-                }
-            }
-        }
+        self.cur_metric.as_mut().unwrap().mut_label().push(cur_lp);
+        debug!("cur-metric: {:?}", self.cur_metric);
 
         self.skip_blank_tab_if_current_blank_tab();
 
@@ -866,48 +848,61 @@ impl<'a, R: Read> TextParser<R> {
 
         match self.cur_mf.borrow().get_field_type() {
             MetricType::SUMMARY => {
-                if self.cur_lp.as_ref().unwrap().get_name() == "quantile" {
-                    // check if quantile float ok
-                    match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
-                        Err(e) => {
-                            debug!("parse_float: {}", e);
-                            self.error = Some(Box::new(ParseError {
-                                msg: format!(
-                                    "expect float as value for quantile lable, got {}",
-                                    self.cur_lp.as_ref().unwrap().get_value(),
-                                ),
-                            }));
-                            self.next_fn = None;
-                            return;
-                        }
-                        Ok(v) => {
-                            debug!("set cur_quantile: {}", v);
-                            self.cur_quantile = v;
+                match self.cur_metric.as_mut().unwrap().mut_label().last_mut() {
+                    Some(cur_lp) => {
+                        debug!("cur-lp: {:?}", cur_lp);
+                        if cur_lp.get_name() == "quantile" {
+                            // check if quantile float ok
+                            match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
+                                Err(e) => {
+                                    debug!("parse_float: {}", e);
+                                    self.error = Some(Box::new(ParseError {
+                                        msg: format!(
+                                            "expect float as value for quantile lable, got {}",
+                                            cur_lp.get_value(),
+                                        ),
+                                    }));
+                                    self.next_fn = None;
+                                    return;
+                                }
+                                Ok(v) => {
+                                    debug!("set cur-quantile: {}", v);
+                                    self.cur_quantile = v;
+                                }
+                            }
                         }
                     }
+                    None => {}
                 }
             }
 
             MetricType::HISTOGRAM => {
-                if self.cur_lp.as_ref().unwrap().get_name() == "le" {
-                    // check if 'le' float ok
-                    match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
-                        Err(e) => {
-                            debug!("parse_float: {}", e);
-                            self.error = Some(Box::new(ParseError {
-                                msg: format!(
-                                    "expect float as value for le lable, got {}",
-                                    self.cur_lp.as_ref().unwrap().get_value(),
-                                ),
-                            }));
-                            self.next_fn = None;
-                            return;
-                        }
-                        Ok(v) => {
-                            debug!("set cur_quantile: {}", v);
-                            self.cur_bucket = v;
+                match self.cur_metric.as_mut().unwrap().mut_label().last_mut() {
+                    Some(cur_lp) => {
+                        debug!("cur-lp: {:?}", cur_lp);
+
+                        if cur_lp.get_name() == "le" {
+                            // check if 'le' float ok
+                            match parse_float(str::from_utf8(&self.cur_token).unwrap()) {
+                                Err(e) => {
+                                    debug!("parse_float: {}", e);
+                                    self.error = Some(Box::new(ParseError {
+                                        msg: format!(
+                                            "expect float as value for le lable, got {}",
+                                            cur_lp.get_value(),
+                                        ),
+                                    }));
+                                    self.next_fn = None;
+                                    return;
+                                }
+                                Ok(v) => {
+                                    debug!("set cur-bucket: {}", v);
+                                    self.cur_bucket = v;
+                                }
+                            }
                         }
                     }
+                    None => {}
                 }
             }
 
@@ -915,8 +910,8 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         debug!(
-            "cur_labels: {:?}, mf_by_name: {:?}, lable pair: {:?}",
-            self.cur_labels, self.mf_by_name, self.cur_lp,
+            "cur-labels: {:?}, mf-by-name: {:?}",
+            self.cur_labels, self.mf_by_name
         );
 
         self.skip_blank_tab();
@@ -1017,7 +1012,7 @@ impl<'a, R: Read> TextParser<R> {
                 self.cur_token.push(self.cur_byte);
                 self.read_byte();
             } else {
-                debug!("got '{}'", self.cur_byte as char);
+                debug!("get '{}'", self.cur_byte as char);
                 break;
             }
         }
@@ -1211,12 +1206,12 @@ some_gauge{path="/api/v1",method="POST"} 1028
 some_gauge{path="/api/v1",method="GET"} 4712
 # HELP api_latency_seconds HTTP request latency partitioned by HTTP API and HTTP status
 # TYPE api_latency_seconds summary
-api_latency_seconds{api="/v1/pull",status="url-error",quantile="0.5"} 0.000952746
-api_latency_seconds{api="/v1/pull",status="url-error",quantile="0.9"} 0.00546789
-api_latency_seconds{api="/v1/pull",status="url-error",quantile="0.99"} 0.009414857
-api_latency_seconds_sum{api="/v1/pull",status="url-error"} 0.1711532899999999
-api_latency_seconds_count{api="/v1/pull",status="url-error"} 104
-api_latency_seconds{api="/v1/usage_trace",status="url-error",quantile="0.5"} 0.000855108
+api_latency_seconds{method="GET",api="/v1/pull",status="url-error",quantile="0.5"} 0.000952746
+api_latency_seconds{method="GET",api="/v1/pull",status="url-error",quantile="0.9"} 0.00546789
+api_latency_seconds{method="GET",api="/v1/pull",status="url-error",quantile="0.99"} 0.009414857
+api_latency_seconds_sum{method="GET",api="/v1/pull",status="url-error"} 0.1711532899999999
+api_latency_seconds_count{method="GET",api="/v1/pull",status="url-error"} 104
+api_latency_seconds{api="/v2/usage_trace",status="url-error",quantile="0.5"} 0.000855108
 api_latency_seconds{api="/v1/usage_trace",status="url-error",quantile="0.9"} 0.001084062
 api_latency_seconds{api="/v1/usage_trace",status="url-error",quantile="0.99"} 0.001084062
 api_latency_seconds_sum{api="/v1/usage_trace",status="url-error"} 0.0032156570000000002
