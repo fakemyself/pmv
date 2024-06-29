@@ -358,39 +358,49 @@ impl<'a, R: Read> TextParser<R> {
                 }
 
                 //if self.mf_by_name.contains_key(&name) {
-                //    // key exist
+                //    // key exist: should we return here?
+                //    debug!("{} exist in mf-by-name: {:?}", name, self.mf_by_name);
                 //    return;
                 //}
 
-                let mut mf = self.cur_mf.borrow_mut();
-                let mf_type = mf.get_field_type();
-                debug!("name: {}, cur-mf name: {}", name, mf.get_name(),);
+                {
+                    let mf = self.cur_mf.borrow();
+                    let mf_type = mf.get_field_type();
+                    debug!("name: {}, cur-mf name: {}", name, mf.get_name(),);
 
-                if mf_type == MetricType::SUMMARY {
-                    if mf.get_name() == summary_metric_name(&name) {
-                        if is_count(&name) {
-                            self.parser_status = Some(ParserStatus::OnSummaryCount);
-                        } else if is_sum(&name) {
-                            self.parser_status = Some(ParserStatus::OnSummarySum);
+                    if mf_type == MetricType::SUMMARY {
+                        if mf.get_name() == summary_metric_name(&name) {
+                            if is_count(&name) {
+                                self.parser_status = Some(ParserStatus::OnSummaryCount);
+                            } else if is_sum(&name) {
+                                self.parser_status = Some(ParserStatus::OnSummarySum);
+                            }
+                            return;
                         }
-                        return;
-                    }
-                } else if mf_type == MetricType::HISTOGRAM {
-                    if mf.get_name() == histogram_metric_name(&name) {
-                        if is_count(&name) {
-                            self.parser_status = Some(ParserStatus::OnHistogramCount);
-                        } else if is_sum(&name) {
-                            self.parser_status = Some(ParserStatus::OnHistogramSum);
+                    } else if mf_type == MetricType::HISTOGRAM {
+                        if mf.get_name() == histogram_metric_name(&name) {
+                            if is_count(&name) {
+                                self.parser_status = Some(ParserStatus::OnHistogramCount);
+                            } else if is_sum(&name) {
+                                self.parser_status = Some(ParserStatus::OnHistogramSum);
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
 
-                debug!("add metric {}", name);
+                self.cur_mf = Rc::new(RefCell::new(MetricFamily::new()));
 
-                mf.set_name(name.clone());
+                self.cur_mf.borrow_mut().set_name(name.clone());
+
+                //self.cur_mf.borrow().set_field_type(v);
+
                 self.mf_by_name.insert(name, self.cur_mf.clone());
-                debug!("mf-by-name: {:?}", self.mf_by_name);
+
+                debug!(
+                    "add metric {:?}, mf-by-name: {:?}",
+                    self.cur_mf, self.mf_by_name
+                );
             }
             Err(err) => {
                 self.error = Some(Box::new(err));
@@ -421,7 +431,7 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         debug!(
-            "------------------\nin read-token-as-metric-name: {}\n---------------------------",
+            "in read-token-as-metric-name: {}\n",
             str::from_utf8(&self.cur_token).unwrap()
         );
     }
@@ -1166,7 +1176,7 @@ mod tests {
     use std::io::{BufReader, Cursor};
 
     #[test]
-    fn test_basic_parse() {
+    fn setup_logger() {
         env_logger::Builder::new()
             .format(|buf, record| {
                 writeln!(
@@ -1181,7 +1191,168 @@ mod tests {
             })
             .filter(None, LevelFilter::Debug)
             .init();
+        debug!("logger setup ok");
+    }
 
+    #[test]
+    fn test_count_parse() {
+        debug!("in test_count_parse");
+
+        let cursor = Cursor::new(
+            String::from(
+                r#"
+# HELP some_other_counter Some counter.
+# TYPE some_other_counter counter
+some_other_counter{path="/api/v1",method="POST"} 1027
+some_other_counter{path="/api/v1",method="GET"} 4711
+"#,
+            )
+            .into_bytes(),
+        );
+
+        let mut parser = TextParser::new(BufReader::new(cursor));
+        let _ = parser.text_to_metric_families();
+        debug!(
+            "reading bytes: {}, lines: {}",
+            parser.reading_bytes, parser.line_count
+        );
+    }
+
+    #[test]
+    fn test_go_runtime_metrics() {
+        //setup_logger();
+        let mut parser = TextParser::new(BufReader::new(Cursor::new(
+            String::from(
+                r#"
+go_cgo_go_to_c_calls_calls_total 8447
+go_gc_cycles_automatic_gc_cycles_total 10
+go_gc_cycles_forced_gc_cycles_total 0
+go_gc_cycles_total_gc_cycles_total 10
+go_gc_duration_seconds{quantile="0"} 3.4709e-05
+go_gc_duration_seconds{quantile="0.25"} 3.9917e-05
+go_gc_duration_seconds{quantile="0.5"} 0.000138459
+go_gc_duration_seconds{quantile="0.75"} 0.000211333
+go_gc_duration_seconds{quantile="1"} 0.000693833
+go_gc_duration_seconds_sum 0.001920708
+go_gc_duration_seconds_count 10
+go_gc_heap_allocs_by_size_bytes_bucket{le="8.999999999999998"} 16889
+go_gc_heap_allocs_by_size_bytes_bucket{le="24.999999999999996"} 221293
+go_gc_heap_allocs_by_size_bytes_bucket{le="64.99999999999999"} 365672
+go_gc_heap_allocs_by_size_bytes_bucket{le="144.99999999999997"} 475633
+go_gc_heap_allocs_by_size_bytes_bucket{le="320.99999999999994"} 507361
+go_gc_heap_allocs_by_size_bytes_bucket{le="704.9999999999999"} 516511
+go_gc_heap_allocs_by_size_bytes_bucket{le="1536.9999999999998"} 521176
+go_gc_heap_allocs_by_size_bytes_bucket{le="3200.9999999999995"} 522802
+go_gc_heap_allocs_by_size_bytes_bucket{le="6528.999999999999"} 524529
+go_gc_heap_allocs_by_size_bytes_bucket{le="13568.999999999998"} 525164
+go_gc_heap_allocs_by_size_bytes_bucket{le="27264.999999999996"} 525269
+go_gc_heap_allocs_by_size_bytes_bucket{le="+Inf"} 525421
+go_gc_heap_allocs_by_size_bytes_sum 7.2408264e+07
+go_gc_heap_allocs_by_size_bytes_count 525421
+go_gc_heap_allocs_bytes_total 7.2408264e+07
+go_gc_heap_allocs_objects_total 525421
+go_gc_heap_frees_by_size_bytes_bucket{le="8.999999999999998"} 11081
+go_gc_heap_frees_by_size_bytes_bucket{le="24.999999999999996"} 168291
+go_gc_heap_frees_by_size_bytes_bucket{le="64.99999999999999"} 271749
+go_gc_heap_frees_by_size_bytes_bucket{le="144.99999999999997"} 352424
+go_gc_heap_frees_by_size_bytes_bucket{le="320.99999999999994"} 378481
+go_gc_heap_frees_by_size_bytes_bucket{le="704.9999999999999"} 385700
+go_gc_heap_frees_by_size_bytes_bucket{le="1536.9999999999998"} 389443
+go_gc_heap_frees_by_size_bytes_bucket{le="3200.9999999999995"} 390591
+go_gc_heap_frees_by_size_bytes_bucket{le="6528.999999999999"} 392069
+go_gc_heap_frees_by_size_bytes_bucket{le="13568.999999999998"} 392565
+go_gc_heap_frees_by_size_bytes_bucket{le="27264.999999999996"} 392636
+go_gc_heap_frees_by_size_bytes_bucket{le="+Inf"} 392747
+go_gc_heap_frees_by_size_bytes_sum 5.3304296e+07
+go_gc_heap_frees_by_size_bytes_count 392747
+go_gc_heap_frees_bytes_total 5.3304296e+07
+go_gc_heap_frees_objects_total 392747
+go_gc_heap_goal_bytes 3.6016864e+07
+go_gc_heap_objects_objects 132674
+go_gc_heap_tiny_allocs_objects_total 36033
+go_gc_limiter_last_enabled_gc_cycle 0
+go_gc_pauses_seconds_bucket{le="9.999999999999999e-10"} 0
+go_gc_pauses_seconds_bucket{le="9.999999999999999e-09"} 0
+go_gc_pauses_seconds_bucket{le="9.999999999999998e-08"} 0
+go_gc_pauses_seconds_bucket{le="1.0239999999999999e-06"} 0
+go_gc_pauses_seconds_bucket{le="1.0239999999999999e-05"} 1
+go_gc_pauses_seconds_bucket{le="0.00010239999999999998"} 15
+go_gc_pauses_seconds_bucket{le="0.0010485759999999998"} 20
+go_gc_pauses_seconds_bucket{le="0.010485759999999998"} 20
+go_gc_pauses_seconds_bucket{le="0.10485759999999998"} 20
+go_gc_pauses_seconds_bucket{le="+Inf"} 20
+go_gc_pauses_seconds_sum 0.000656384
+go_gc_pauses_seconds_count 20
+go_gc_stack_starting_size_bytes 4096
+go_goroutines 102
+go_info{version="go1.19.5"} 1
+go_memory_classes_heap_free_bytes 8.839168e+06
+go_memory_classes_heap_objects_bytes 1.9103968e+07
+go_memory_classes_heap_released_bytes 3.530752e+06
+go_memory_classes_heap_stacks_bytes 2.4576e+06
+go_memory_classes_heap_unused_bytes 8.011552e+06
+go_memory_classes_metadata_mcache_free_bytes 3600
+go_memory_classes_metadata_mcache_inuse_bytes 12000
+go_memory_classes_metadata_mspan_free_bytes 77472
+go_memory_classes_metadata_mspan_inuse_bytes 426960
+go_memory_classes_metadata_other_bytes 6.201928e+06
+go_memory_classes_os_stacks_bytes 0
+go_memory_classes_other_bytes 1.931459e+06
+go_memory_classes_profiling_buckets_bytes 1.489565e+06
+go_memory_classes_total_bytes 5.2086024e+07
+go_memstats_alloc_bytes 1.9103968e+07
+go_memstats_alloc_bytes_total 7.2408264e+07
+go_memstats_buck_hash_sys_bytes 1.489565e+06
+go_memstats_frees_total 428780
+go_memstats_gc_sys_bytes 6.201928e+06
+go_memstats_heap_alloc_bytes 1.9103968e+07
+go_memstats_heap_idle_bytes 1.236992e+07
+go_memstats_heap_inuse_bytes 2.711552e+07
+go_memstats_heap_objects 132674
+go_memstats_heap_released_bytes 3.530752e+06
+go_memstats_heap_sys_bytes 3.948544e+07
+go_memstats_last_gc_time_seconds 1.6992580814748092e+09
+go_memstats_lookups_total 0
+go_memstats_mallocs_total 561454
+go_memstats_mcache_inuse_bytes 12000
+go_memstats_mcache_sys_bytes 15600
+go_memstats_mspan_inuse_bytes 426960
+go_memstats_mspan_sys_bytes 504432
+go_memstats_next_gc_bytes 3.6016864e+07
+go_memstats_other_sys_bytes 1.931459e+06
+go_memstats_stack_inuse_bytes 2.4576e+06
+go_memstats_stack_sys_bytes 2.4576e+06
+go_memstats_sys_bytes 5.2086024e+07
+go_sched_gomaxprocs_threads 10
+go_sched_goroutines_goroutines 102
+go_sched_latencies_seconds_bucket{le="9.999999999999999e-10"} 4886
+go_sched_latencies_seconds_bucket{le="9.999999999999999e-09"} 4886
+go_sched_latencies_seconds_bucket{le="9.999999999999998e-08"} 5883
+go_sched_latencies_seconds_bucket{le="1.0239999999999999e-06"} 6669
+go_sched_latencies_seconds_bucket{le="1.0239999999999999e-05"} 7191
+go_sched_latencies_seconds_bucket{le="0.00010239999999999998"} 7531
+go_sched_latencies_seconds_bucket{le="0.0010485759999999998"} 7567
+go_sched_latencies_seconds_bucket{le="0.010485759999999998"} 7569
+go_sched_latencies_seconds_bucket{le="0.10485759999999998"} 7569
+go_sched_latencies_seconds_bucket{le="+Inf"} 7569
+go_sched_latencies_seconds_sum 0.00988825
+go_sched_latencies_seconds_count 7569
+go_threads 16
+"#,
+            )
+            .into_bytes(),
+        )));
+
+        let _ = parser.text_to_metric_families();
+        debug!(
+            "reading bytes: {}, lines: {}",
+            parser.reading_bytes, parser.line_count
+        );
+    }
+
+    #[test]
+    fn test_basic_parse() {
+        //setup_logger();
         debug!("testing test_basic_parse");
 
         let cursor = Cursor::new(
