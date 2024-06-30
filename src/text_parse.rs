@@ -87,39 +87,41 @@ impl<'a, R: Read> TextParser<R> {
         }
     }
 
-    pub fn text_to_metric_families(&mut self) -> Result<HashMap<String, MetricFamily>, io::Error> {
+    fn pretty_metrics(&self) {
+        for (k, v) in self.mf_by_name.iter() {
+            debug!(
+                "=> {}: {}/{:?}: {}",
+                k,
+                v.borrow().get_name(),
+                v.borrow().get_field_type(),
+                v.borrow().get_help(),
+            );
+
+            for m in v.borrow().get_metric() {
+                debug!("\t {:?}", m);
+            }
+        }
+    }
+
+    pub fn text_to_metric_families(&mut self) -> Result<(), io::Error> {
         self.next_fn = Some(TextParser::start_of_line);
         loop {
             match self.next_fn {
-                Some(next) => {
-                    next(self);
-                }
-                None => {
-                    for (k, v) in self.mf_by_name.iter() {
-                        debug!(
-                            "=> {}: {}/{:?}: {}",
-                            k,
-                            v.borrow().get_name(),
-                            v.borrow().get_field_type(),
-                            v.borrow().get_help(),
-                        );
-
-                        for m in v.borrow().get_metric() {
-                            debug!("\t {:?}", m);
-                        }
+                Some(next) => next(self),
+                None => match &self.error {
+                    Some(_err) => {
+                        error!("get error: {:?}", _err);
+                        break;
                     }
-                    match &self.error {
-                        Some(_err) => {
-                            error!("get error: {:?}", _err);
-                        }
-                        None => {}
+                    None => {
+                        break;
                     }
-                    break;
-                }
+                },
             }
         }
+        Ok(())
 
-        Ok(HashMap::new()) // TODO: return empty
+        //Ok(HashMap::new()) // TODO: return empty
     }
 
     fn start_of_line(&mut self) {
@@ -299,7 +301,7 @@ impl<'a, R: Read> TextParser<R> {
             }
         };
 
-        debug!("mf_by_name(after set HELP): {:?}", self.mf_by_name);
+        debug!("mf-by-name(after set HELP): {:?}", self.mf_by_name);
 
         self.next_fn = Some(TextParser::start_of_line);
         return;
@@ -357,11 +359,11 @@ impl<'a, R: Read> TextParser<R> {
                     return;
                 }
 
-                //if self.mf_by_name.contains_key(&name) {
-                //    // key exist: should we return here?
-                //    debug!("{} exist in mf-by-name: {:?}", name, self.mf_by_name);
-                //    return;
-                //}
+                if self.mf_by_name.contains_key(&name) {
+                    // key exist: should we return here?
+                    debug!("{} exist in mf-by-name: {:?}", name, self.mf_by_name);
+                    return;
+                }
 
                 {
                     let mf = self.cur_mf.borrow();
@@ -390,16 +392,13 @@ impl<'a, R: Read> TextParser<R> {
                 }
 
                 self.cur_mf = Rc::new(RefCell::new(MetricFamily::new()));
-
                 self.cur_mf.borrow_mut().set_name(name.clone());
-
-                //self.cur_mf.borrow().set_field_type(v);
-
                 self.mf_by_name.insert(name, self.cur_mf.clone());
 
                 debug!(
-                    "add metric {:?}, mf-by-name: {:?}",
-                    self.cur_mf, self.mf_by_name
+                    "add metric {:?}, mf-by-name: {}",
+                    self.cur_mf.borrow(),
+                    self.mf_by_name.len(),
                 );
             }
             Err(err) => {
@@ -742,6 +741,16 @@ impl<'a, R: Read> TextParser<R> {
 
         let label_name = String::from_utf8(self.cur_token.clone()).unwrap();
 
+        // Set metric type if there is no TYPE hint available.
+        match label_name.as_str() {
+            "le" => self
+                .cur_mf
+                .borrow_mut()
+                .set_field_type(MetricType::HISTOGRAM),
+            "quantile" => self.cur_mf.borrow_mut().set_field_type(MetricType::SUMMARY),
+            _ => {} // pass
+        }
+
         let mut cur_lp = LabelPair::new();
 
         cur_lp.set_name(label_name);
@@ -920,8 +929,9 @@ impl<'a, R: Read> TextParser<R> {
         }
 
         debug!(
-            "cur-labels: {:?}, mf-by-name: {:?}",
-            self.cur_labels, self.mf_by_name
+            "cur-labels: {:?}, mf-by-name: {}",
+            self.cur_labels,
+            self.mf_by_name.len()
         );
 
         self.skip_blank_tab();
@@ -1212,6 +1222,7 @@ some_other_counter{path="/api/v1",method="GET"} 4711
 
         let mut parser = TextParser::new(BufReader::new(cursor));
         let _ = parser.text_to_metric_families();
+        parser.pretty_metrics();
         debug!(
             "reading bytes: {}, lines: {}",
             parser.reading_bytes, parser.line_count
@@ -1344,6 +1355,7 @@ go_threads 16
         )));
 
         let _ = parser.text_to_metric_families();
+        parser.pretty_metrics();
         debug!(
             "reading bytes: {}, lines: {}",
             parser.reading_bytes, parser.line_count
@@ -1397,9 +1409,21 @@ api_latency_seconds{api="/v1/drop",status="url-error",quantile="0.9"} 0.00682946
         let mut parser = TextParser::new(BufReader::new(cursor));
 
         let _ = parser.text_to_metric_families();
+        parser.pretty_metrics();
+
         debug!(
             "reading bytes: {}, lines: {}",
             parser.reading_bytes, parser.line_count
+        );
+
+        debug!(
+            "mf-by-name element: {:?}",
+            parser
+                .mf_by_name
+                .get("http2_request_duration_seconds_sum")
+                .unwrap()
+                .borrow()
+                .get_metric()
         );
     }
 }
