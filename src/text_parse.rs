@@ -1,4 +1,4 @@
-use log::{debug, error};
+use log::{debug, error, info};
 use prometheus::proto::{
     Bucket, Counter, Gauge, Histogram, LabelPair, Metric, MetricFamily, MetricType, Quantile,
     Summary,
@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, ErrorKind, Read};
 use std::num::ParseFloatError;
 use std::rc::Rc;
 use std::str;
@@ -35,7 +35,7 @@ pub struct TextParser<R: Read> {
 
     cur_labels: HashMap<String, String>,
 
-    mf_by_name: HashMap<String, Rc<RefCell<MetricFamily>>>,
+    pub mf_by_name: HashMap<String, Rc<RefCell<MetricFamily>>>,
     cur_mf: Rc<RefCell<MetricFamily>>,
 
     cur_token: Vec<u8>,
@@ -87,7 +87,7 @@ impl<'a, R: Read> TextParser<R> {
         }
     }
 
-    fn pretty_metrics(&self) {
+    pub fn pretty_metrics(&self) {
         for (k, v) in self.mf_by_name.iter() {
             debug!(
                 "=> {}: {}/{:?}: {}",
@@ -110,7 +110,6 @@ impl<'a, R: Read> TextParser<R> {
                 Some(next) => next(self),
                 None => match &self.error {
                     Some(_err) => {
-                        error!("get error: {:?}", _err);
                         break;
                     }
                     None => {
@@ -120,8 +119,6 @@ impl<'a, R: Read> TextParser<R> {
             }
         }
         Ok(())
-
-        //Ok(HashMap::new()) // TODO: return empty
     }
 
     fn start_of_line(&mut self) {
@@ -1068,7 +1065,12 @@ impl<'a, R: Read> TextParser<R> {
                 self.cur_byte = buf[0];
             }
             Err(err) => {
-                error!("read_exact: {:?}", err);
+                if err.kind() != ErrorKind::UnexpectedEof {
+                    error!("read_exact: {:?}", err);
+                } else {
+                    info!("EOF");
+                }
+
                 self.error = Some(Box::new(err));
                 self.next_fn = None
             }
